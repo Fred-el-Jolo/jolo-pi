@@ -1,0 +1,12 @@
+{"query":"postgres connection timeout under load","expected_ids":["recap-db-01"],"type":"recap"}
+{"query":"auth token refresh race condition","expected_ids":["recap-auth-01"],"type":"recap"}
+{"query":"browser cors origin blocked preflight","expected_ids":["recap-cors-01"],"type":"recap"}
+{"query":"oauth google login session provider","expected_ids":["recap-oauth-01"],"type":"recap"}
+{"query":"pdf invoice monthly report export","expected_ids":["recap-report-01"],"type":"recap"}
+{"query":"express fastify migrate rest api","expected_ids":["recap-migrate-01"],"type":"recap"}
+{"query":"sqlite sd card corruption wal checkpoint","expected_ids":["recap-pi-01"],"type":"recap"}
+{"query":"embedding recall latency p95 optimize","expected_ids":["recap-perf-01"],"type":"recap"}
+{"query":"webpack circular dependency build fail","expected_ids":["recap-build-01"],"type":"recap"}
+{"query":"research competitor pricing pages scrape","expected_ids":["recap-research-01"],"type":"recap"}
+{"query":"python memory leak generator oom","expected_ids":["recap-mem-01"],"type":"recap"}
+{"query":"internationalization translation catalog french","expected_ids":["recap-i18n-01"],"type":"recap"}

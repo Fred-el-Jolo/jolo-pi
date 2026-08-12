@@ -1,0 +1,12 @@
+{"id":"recap-db-01","type":"recap","project":"proj-alpha","body":"Fixed postgres connection pool exhaustion under load by raising the pool size.","meta":{"status":"done","initial_prompt":"db connection timeouts under load"}}
+{"id":"recap-auth-01","type":"recap","project":"proj-alpha","body":"Fixed a jwt token refresh race condition by rotating refresh tokens.","meta":{"status":"done","initial_prompt":"auth token refresh flaky"}}
+{"id":"recap-cors-01","type":"recap","project":"proj-beta","body":"Fixed CORS preflight blocked by setting access-control-allow-origin.","meta":{"status":"done","initial_prompt":"browser fetch blocked by cors"}}
+{"id":"recap-oauth-01","type":"recap","project":"proj-alpha","body":"Added OAuth login with the Google provider and session handling.","meta":{"status":"done","initial_prompt":"add oauth login with google"}}
+{"id":"recap-report-01","type":"recap","project":"proj-beta","body":"Built the monthly PDF invoice report export.","meta":{"status":"done","initial_prompt":"generate monthly invoice report"}}
+{"id":"recap-migrate-01","type":"recap","project":"proj-alpha","body":"Migrated the REST API from Express to Fastify.","meta":{"status":"done","initial_prompt":"migrate rest api from express to fastify"}}
+{"id":"recap-pi-01","type":"recap","project":"proj-pi","body":"Fixed sqlite WAL checkpoint sd-card corruption by moving WAL to tmpfs.","meta":{"status":"done","initial_prompt":"sqlite corruption on the pi"}}
+{"id":"recap-perf-01","type":"recap","project":"proj-pi","body":"Optimized embedding recall p95 latency to under 50ms.","meta":{"status":"partial","initial_prompt":"embedding recall too slow"}}
+{"id":"recap-build-01","type":"recap","project":"proj-alpha","body":"Debugging a webpack circular dependency build failure; tried lazy imports, unresolved.","meta":{"status":"failed","initial_prompt":"webpack build fails"}}
+{"id":"recap-research-01","type":"recap","project":"proj-beta","body":"Researched competitor pricing pages via scrape.","meta":{"status":"done","initial_prompt":"research competitor pricing"}}
+{"id":"recap-mem-01","type":"recap","project":"proj-pi","body":"Fixed a python generator memory leak / OOM by closing the generator in finally.","meta":{"status":"done","initial_prompt":"python oom on the pi"}}
+{"id":"recap-i18n-01","type":"recap","project":"proj-beta","body":"Added i18n translation catalog (French).","meta":{"status":"done","initial_prompt":"add french translations"}}

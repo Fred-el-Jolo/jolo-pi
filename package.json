@@ -1,0 +1,15 @@
+{
+  "name": "jolo-pi",
+  "version": "0.1.0",
+  "private": true,
+  "description": "Personal pi (coding-agent) customizations, organized by kind: skills, extensions (incl. the specloop memory extension), themes, the specloop-core engine, and notes. Loaded by absolute path from ~/.pi/agent/settings.json.",
+  "license": "MIT",
+  "keywords": ["pi-package", "pi-extension", "pi-skills"],
+  "pi": {
+    "extensions": ["./extensions/specloop-pi/extension/extension.ts"],
+    "skills": ["./skills/process-extractor", "./skills/isa"]
+  },
+  "peerDependencies": {
+    "@earendil-works/pi-coding-agent": "*"
+  }
+}

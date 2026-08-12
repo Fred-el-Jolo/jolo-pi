@@ -1,0 +1,11 @@
+{
+  "name": "specloop-pi",
+  "version": "0.1.0",
+  "description": "Minimal wired-in memory for the pi coding agent (specloop). Recall on the first prompt, recap on session quit; embeddings + recap summary via the specloop-core python engine.",
+  "license": "MIT",
+  "keywords": ["pi-package", "pi-extension", "specloop", "memory"],
+  "type": "module",
+  "pi": {
+    "extensions": ["./extension/extension.ts"]
+  }
+}

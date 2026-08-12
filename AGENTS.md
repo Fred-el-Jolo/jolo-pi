@@ -1,6 +1,19 @@
 # jolo-pi — customizations for the pi coding agent
 
-This repo holds **my personal customizations of [pi](https://github.com/earendil-works/pi)** (the `@earendil-works/pi-coding-agent` CLI/TUI). It is a scratch/workspace repo, not a publishable package (unless something here later earns its own package).
+This repo holds **all my personal customizations of [pi](https://github.com/earendil-works/pi)** (the `@earendil-works/pi-coding-agent` CLI/TUI) — skills, extensions, themes, the specloop memory engine, and notes — organized by kind. It is a pi-package (root `package.json` registers the extensions + skills), but in practice everything is loaded by absolute path from `~/.pi/agent/settings.json`.
+
+## Repo layout (organized by kind)
+
+| Path | Kind | Contents |
+|---|---|---|
+| `skills/` | pi skills (`SKILL.md`) | `process-extractor`, `isa` (+ `README.md` skill-format reference) |
+| `extensions/` | pi extensions (TS) | `specloop-pi/` (wired-in memory extension), `zai-footer.ts` |
+| `lib/` | supporting libraries | `specloop-core/` (python memory engine the `specloop-pi` extension shells out to) |
+| `themes/` | pi themes (JSON) | `dark-bright.json` |
+| `notes/` | design notes / research | `lifeos-skills-review.md` |
+| `LEARNING.md` | walkthrough for `extensions/zai-footer.ts` | |
+
+> Consolidation note: the former `skills/` repo was folded in here by kind; `skills/` now holds **only** `SKILL.md` folders.
 
 ## What pi is
 
@@ -49,4 +62,11 @@ Resolve any `docs/...` or `examples/...` path the user mentions against that ins
 - **Code:** `themes/dark-bright.json` · full copy of the built-in `dark` theme with one change: `vars.dimGray` `#666666` → `#909090` (recommended readability level). All 53 color tokens otherwise identical.
 - **Why:** the built-in footer (`footer.js`) renders nearly all its text with the `dim` token (6×), which is nearly invisible at `#666666`. Bumping `dimGray` makes the **standard footer readable** — and since the z.ai segment (item 1) also uses `dim`, both footers share the same bright grey.
 - **Applied via** `~/.pi/agent/settings.json`: `"theme": "dark-bright"` + `"themes": ["/home/jolo/dev/jolo-pi/themes/dark-bright.json"]` (source stays in the visible repo; settings references it by absolute path).
-- **Blast radius:** `dim` is used across pi's UI (subdued text/separators), so this brightens all of it, not just the footer. `muted` (`gray #808080`), borders (`darkGray #505050`), and the intentional warning/error colors are untouched — so `dim` is now slightly brighter than `muted` (a minor hierarchy inversion, accepted).
+### 3. specloop — wired-in memory extension *(active)*
+- **Code:** `extensions/specloop-pi/` (extension) + `lib/specloop-core/` (python engine) · **docs:** `extensions/specloop-pi/README.md`
+- **What:** minimal two-touch memory — recall similar past recaps on the session's first prompt, write one recap node when the session quits. No mid-session recall, no per-error capture.
+- **Applied via** `~/.pi/agent/settings.json` `extensions` (absolute path to `extensions/specloop-pi/extension/extension.ts`). The extension auto-locates `lib/specloop-core/scripts/mem.py` relatively; override with `SPECLOOP_MEM`.
+
+### 4. skills — `process-extractor`, `isa` *(process-extractor active; isa = scaffold)*
+- **Code:** `skills/process-extractor/` (capture an existing process as a doc), `skills/isa/` (spec/completeness discipline — scaffold pending a source port; see `skills/isa/references/design-decision.md`).
+- **Applied via** `~/.pi/agent/settings.json` `skills` (absolute paths). Skill-format reference: `skills/README.md`.
