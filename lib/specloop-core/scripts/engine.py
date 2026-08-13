@@ -29,7 +29,7 @@ from typing import Optional, Sequence
 from httputil import post_json
 from redact import redact
 
-DEDUP_THRESHOLD = 0.98  # open-questions §8
+DEDUP_THRESHOLD = 0.92  # recap dedup on the initial-PROMPT vector (§8)
 
 
 # --------------------------------------------------------------- Embedders
@@ -142,7 +142,8 @@ CREATE TABLE IF NOT EXISTS nodes (
     created        REAL NOT NULL,
     body           TEXT NOT NULL,
     meta           TEXT NOT NULL DEFAULT '{}',
-    embedding      TEXT NOT NULL
+    embedding      TEXT NOT NULL,
+    embedding_prompt TEXT
 );
 CREATE INDEX IF NOT EXISTS idx_type    ON nodes(type);
 CREATE INDEX IF NOT EXISTS idx_root    ON nodes(root_prompt_id);
@@ -161,6 +162,8 @@ class Memory:
         self.conn.row_factory = sqlite3.Row
         self.conn.executescript(_SCHEMA)
         self.conn.commit()
+        self._migrate()
+        self._backfill_prompt_vectors()
 
     # -- internals ---------------------------------------------------------
     @staticmethod
@@ -181,18 +184,81 @@ class Memory:
             nb += y * y
         return dot / (math.sqrt(na) * math.sqrt(nb)) if na and nb else 0.0
 
-    def _find_dup(self, ntype: str, body: str, project: Optional[str]) -> Optional[str]:
-        """open-questions §8: merge a near-identical node instead of duplicating."""
-        q = self.embedder.embed(body)
+    def _find_dup(self, ntype: str, prompt: str, project: Optional[str]) -> Optional[str]:
+        """§8: merge a recap whose initial-PROMPT vector is near-identical.
+        Dedup is on the user's ASK (prompt), not the summary body — so a failed
+        attempt and a later partial on the same task merge regardless of how
+        differently their summaries read. Status is ignored at match time; the
+        higher-status summary survives via _maybe_promote."""
+        q = self.embedder.embed(prompt)
         rows = self.conn.execute(
-            "SELECT id, embedding FROM nodes WHERE type=? AND project IS ?",
+            "SELECT id, embedding_prompt FROM nodes WHERE type=? AND project IS ?",
             (ntype, project)).fetchall()
         best, best_id = 0.0, None
         for r in rows:
-            s = self._cosine(q, json.loads(r["embedding"]))
+            ep = r["embedding_prompt"]
+            if ep is None:
+                continue  # legacy row pre-prompt-dedup — skip until backfilled
+            s = self._cosine(q, json.loads(ep))
             if s > best:
                 best, best_id = s, r["id"]
         return best_id if best >= DEDUP_THRESHOLD else None
+
+    # status precedence for dedup survivor selection: the node with the
+    # higher-rank summary wins the merge. ``void`` is never stored (skipped at
+    # cmd_recap), so it's absent; ``error`` ranks lowest so a real summary
+    # always supersedes a crashed attempt.
+    _STATUS_RANK = {"done": 4, "partial": 3, "failed": 2, "error": 1}
+
+    def _maybe_promote(self, dup_id: str, new_meta: dict, new_body: str) -> None:
+        """On prompt-vector merge: if the new recap outranks the existing node's
+        status, overwrite its body+meta with the better summary. Equal or lower
+        rank → keep the existing node unchanged (stable; no churn)."""
+        row = self.conn.execute("SELECT meta FROM nodes WHERE id=?", (dup_id,)).fetchone()
+        if row is None:
+            return
+        old_rank = self._STATUS_RANK.get(
+            (json.loads(row["meta"] or "{}")).get("status"), 0)
+        new_rank = self._STATUS_RANK.get(new_meta.get("status"), 0)
+        if new_rank > old_rank:
+            # body changed → re-embed so recall ranking tracks the NEW summary,
+            # not the stale pre-merge one
+            self.conn.execute(
+                "UPDATE nodes SET body=?, meta=?, embedding=? WHERE id=?",
+                (new_body, json.dumps(new_meta),
+                 json.dumps(self.embedder.embed(new_body)), dup_id))
+            self.conn.commit()
+
+    def _migrate(self) -> None:
+        """Add columns introduced after the initial schema to existing DBs.
+        CREATE TABLE IF NOT EXISTS won't alter an existing table, so patch
+        here. Idempotent: checks PRAGMA table_info before altering."""
+        cols = {r[1] for r in self.conn.execute("PRAGMA table_info(nodes)")}
+        if "embedding_prompt" not in cols:
+            self.conn.execute("ALTER TABLE nodes ADD COLUMN embedding_prompt TEXT")
+            self.conn.commit()
+
+    def _backfill_prompt_vectors(self) -> None:
+        """Populate embedding_prompt for recap rows that predate the column
+        (prompt-vector dedup needs them). Best-effort: an embed failure leaves
+        the row unfilled and _find_dup skips it until the next successful pass.
+        A no-op once all recap rows carry a prompt vector."""
+        rows = self.conn.execute(
+            "SELECT id, meta FROM nodes WHERE type='recap' AND embedding_prompt IS NULL"
+        ).fetchall()
+        for r in rows:
+            try:
+                prompt = (json.loads(r["meta"] or "{}")).get("initial_prompt")
+                if not prompt:
+                    continue
+                vec = self.embedder.embed(prompt)
+                self.conn.execute(
+                    "UPDATE nodes SET embedding_prompt=? WHERE id=?",
+                    (json.dumps(vec), r["id"]))
+            except Exception:
+                continue  # leave for the next pass; never block recall/recap
+        if rows:
+            self.conn.commit()
 
     # -- public API (the contract facades rely on) -------------------------
     # Types that dedup-on-write (open-questions §8): one node per distinct
@@ -213,7 +279,8 @@ class Memory:
         return out
 
     def index(self, node: dict) -> str:
-        """Insert a node (+ embedding). recap nodes dedup-on-write.
+        """Insert a node (+ embeddings). recap nodes dedup-on-write on the
+        initial-PROMPT vector; the higher-status summary survives a merge.
         Returns the id used (may be an existing id if merged)."""
         ntype = node["type"]
         project = node.get("project", self.current_project)
@@ -221,17 +288,27 @@ class Memory:
         meta = self._redact_meta(node.get("meta", {}))
 
         if ntype in self._DEDUP_TYPES:
-            dup = self._find_dup(ntype, body, project)
+            # dedup on the prompt vector; fall back to body when meta has no
+            # initial_prompt (manual/test nodes). Status is ignored at match
+            # time — _maybe_promote keeps the higher-ranked summary.
+            prompt = meta.get("initial_prompt") or body
+            dup = self._find_dup(ntype, prompt, project)
             if dup is not None:
+                self._maybe_promote(dup, meta, body)
                 return dup
 
         nid = node.get("id") or str(uuid.uuid4())
+        embedding = self.embedder.embed(body)
+        embedding_prompt = None
+        if ntype in self._DEDUP_TYPES:
+            embedding_prompt = self.embedder.embed(meta.get("initial_prompt") or body)
         self.conn.execute(
-            "INSERT INTO nodes(id,type,root_prompt_id,project,created,body,meta,embedding) "
-            "VALUES(?,?,?,?,?,?,?,?)",
+            "INSERT INTO nodes(id,type,root_prompt_id,project,created,body,meta,embedding,embedding_prompt) "
+            "VALUES(?,?,?,?,?,?,?,?,?)",
             (nid, ntype, node.get("root_prompt_id"), project,
              node.get("created", time.time()), body,
-             json.dumps(meta), json.dumps(self.embedder.embed(body))),
+             json.dumps(meta), json.dumps(embedding),
+             json.dumps(embedding_prompt) if embedding_prompt is not None else None),
         )
         self.conn.commit()
         return nid

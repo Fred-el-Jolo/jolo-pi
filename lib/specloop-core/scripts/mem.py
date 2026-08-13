@@ -225,10 +225,20 @@ def cmd_recap(m, args):
             summary = (res.get("summary") or "").strip()
             status = res.get("status", "partial")
             body = summary or status
-        except Exception as e:  # network/model failure is best-effort
+        except Exception as e:  # technical failure — flag, don't conflate with semantic partial
+            status = "error"
             warnings.append(f"summary: {e}")
             body = initial_prompt
     meta = _stamp({"status": status, "summary": summary, "initial_prompt": initial_prompt})
+
+    # void = nothing worth remembering: don't pollute the graph. Audit only.
+    if status == "void":
+        _log_write("recap", None, root=None, merged=False, meta=meta)
+        print(json.dumps({"recap_id": None, "status": "void", "merged": False,
+                          "warnings": warnings}, indent=2, default=str) if args.json
+              else "recap=void (not stored)")
+        return
+
     before = m.count()
     recap_id = m.index({"type": "recap", "body": body, "meta": meta})
     merged = m.count() == before

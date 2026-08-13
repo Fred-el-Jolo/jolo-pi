@@ -106,9 +106,9 @@ _SESSION_SYSTEM = (
     "and the final state. If the subject drifted or evolved away from the "
     "initial prompt over the session, fold that into the summary so future "
     "recall reflects the REAL outcome, not just the original ask), "
-    '"status": "done" | "partial" | "failed"}. '
-    "Be terse and factual. If the session did nothing meaningful, return "
-    '{"status":"partial","summary":""}.'
+    '"status": "done" | "partial" | "failed" | "void"}. '
+    "done=goal accomplished; partial=partly done or drifted; failed=the work failed; VOID=accomplished nothing worth remembering (trivial/abandoned/chat). Be terse and factual. If the session did nothing meaningful, return "
+    '{"status":"void","summary":""}.'
 )
 
 

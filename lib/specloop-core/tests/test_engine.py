@@ -25,7 +25,8 @@ class EngineTests(unittest.TestCase):
         self.assertEqual(res[0]["id"], "a")
 
     def test_recap_dedup_on_write(self):
-        # one node per distinct recap; re-indexing a near-identical body merges
+        # recap dedup is on the initial-PROMPT vector; with no prompt in meta
+        # it falls back to the body, so re-indexing near-identical bodies merges
         first = self.mem.index(self._node(body="migrate rest api from express to fastify"))
         self.assertEqual(self.mem.count(), 1)
         again = self.mem.index(self._node(body="migrate rest api from express to fastify"))
@@ -34,6 +35,39 @@ class EngineTests(unittest.TestCase):
         # unrelated body → new node
         self.mem.index(self._node(body="something totally unrelated xyzzy"))
         self.assertEqual(self.mem.count(), 2)
+
+    def test_recap_dedup_on_prompt_across_statuses(self):
+        # same initial prompt, DIFFERENT summaries + statuses → merge on prompt,
+        # regardless of status. The higher-status summary survives.
+        a = self.mem.index(self._node(
+            body="migration failed: rpi-clone not installed",
+            meta={"status": "failed",
+                  "initial_prompt": "migrate sd card to external usb hard drive"}))
+        b = self.mem.index(self._node(
+            body="migration partial: cloned via rpi-clone, smartd alerts pending",
+            meta={"status": "partial",
+                  "initial_prompt": "migrate sd card to external usb hard drive"}))
+        self.assertEqual(a, b)            # merged onto the same node
+        self.assertEqual(self.mem.count(), 1)
+        # the partial (higher rank) body won
+        stored = self.mem.conn.execute(
+            "SELECT body FROM nodes WHERE id=?", (a,)).fetchone()["body"]
+        self.assertIn("cloned via rpi-clone", stored)
+
+    def test_recap_promotion_not_downgrade(self):
+        # a later LOWER-status recap on the same prompt must NOT clobber a done one
+        done = self.mem.index(self._node(
+            body="deployed to github pages via bun, verified",
+            meta={"status": "done",
+                  "initial_prompt": "deploy this repo to github pages"}))
+        self.mem.index(self._node(
+            body="deploy failed: bun missing",
+            meta={"status": "failed",
+                  "initial_prompt": "deploy this repo to github pages"}))
+        self.assertEqual(self.mem.count(), 1)
+        stored = self.mem.conn.execute(
+            "SELECT body FROM nodes WHERE id=?", (done,)).fetchone()["body"]
+        self.assertIn("verified", stored)  # done body kept, not overwritten
 
     def test_scope_local_vs_global(self):
         self.mem.index(self._node(id="a", project="proj-a", body="postgres pool timeout"))
