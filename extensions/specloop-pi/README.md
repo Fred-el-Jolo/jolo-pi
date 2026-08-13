@@ -24,7 +24,7 @@ That's the entire surface. No mid-session recall, no per-error capture, no per-t
 From this repo (dev), load it directly:
 
 ```bash
-pi -e /home/jolo/dev/skills/specloop-pi/extension/extension.ts
+pi -e /home/jolo/dev/jolo-pi/extensions/specloop-pi/extension/extension.ts
 ```
 
 Or drop a symlink in `~/.pi/agent/extensions/`, or install as a pi package (see `package.json`). It auto-locates `mem.py` at `../../lib/specloop-core/scripts/mem.py` relative to itself; override with `SPECLOOP_MEM` when installed elsewhere.
