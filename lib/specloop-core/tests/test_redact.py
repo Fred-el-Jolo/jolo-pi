@@ -4,15 +4,8 @@
 Covers: each high-precision pattern fires; non-mangling of hashes/uuids/prose;
 SPECLOOP_REDACT=0 disables; default-on when env unset.
 
-Fake-fixture note
------------------
-Every secret-like value below is a deliberately fake mock. Secret scanners
-(GitHub push protection included) flag any string matching a provider's token
-*shape* — they do not care that a value says "FAKE". So each fixture is a named
-constant assembled from fragments: no provider-shaped token appears as a
-contiguous literal in this file (scanners read source bytes), yet each
-reassembles at runtime into a value that matches the redaction regex under
-test. All fail provider validation (invalid checksum / not-issued).
+Every secret-like string below is a plain, explicitly-fake mock (FAKE_* plus
+filler X's) chosen to match the redaction regexes. None are real secrets.
 """
 import os
 import sys
@@ -20,25 +13,6 @@ import unittest
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "scripts"))
 import redact  # noqa: E402
-
-# --- Fake fixtures ---------------------------------------------------------
-# Fragmented so no provider token shape is ever a contiguous source literal;
-# each reassembles at runtime to a value the redactor must match.
-AWS_FAKE_KEY      = "AKIA" + "IOSFODNN7EXAMPLE"            # AWS docs' canonical example
-GITHUB_FAKE_PAT   = "ghp" + "_" + "A" * 36                 # bogus body, invalid checksum
-STRIPE_FAKE_KEY   = "sk" + "_live_" + "A" * 24             # live prefix, bogus body
-OPENAI_FAKE_KEY   = "sk" + "-proj-" + "A" * 21             # proj prefix, bogus body
-FAKE_JWT          = (("ey" + "J" + "A" * 10) + "."
-                     + ("ey" + "J" + "B" * 10) + "."
-                     + ("C" * 10))
-BEARER_FAKE_TOKEN = "X" * 24                                # goes after the word "Bearer "
-PG_FAKE_PASSWORD  = "X" * 18                               # url-creds password
-GENERIC_FAKE_KEY  = "X" * 20                               # key-assign value (>=16 chars)
-FAKE_PEM          = "\n".join([
-    "-----BEGIN " + "MOCK PRIVATE KEY" + "-----",
-    "X" * 40,
-    "-----END " + "MOCK PRIVATE KEY" + "-----",
-])
 
 
 class RedactTests(unittest.TestCase):
@@ -53,42 +27,41 @@ class RedactTests(unittest.TestCase):
             os.environ.pop("SPECLOOP_REDACT", None)
 
     def test_aws_access_key(self):
-        out = redact.redact(f"config AWS_ACCESS_KEY_ID={AWS_FAKE_KEY} done")
+        out = redact.redact("config AWS_ACCESS_KEY_ID=AKIAFAKEAWSKEYXXXXXX done")
         self.assertIn("[REDACTED:aws-access-key]", out)
-        self.assertNotIn(AWS_FAKE_KEY, out)
+        self.assertNotIn("AKIAFAKEAWSKEYXXXXXX", out)
 
     def test_github_token(self):
-        out = redact.redact(f"GH_TOKEN={GITHUB_FAKE_PAT}")
+        out = redact.redact("GH_TOKEN=ghp_FAKEGITHUBTOKENXXXXXXXXXXXXXXXXXXXXX")
         self.assertIn("[REDACTED:github-token]", out)
-        self.assertNotIn(GITHUB_FAKE_PAT, out)
+        self.assertNotIn("ghp_FAKEGITHUBTOKENXXXXXXXXXXXXXXXXXXXXX", out)
 
     def test_stripe_key(self):
-        out = redact.redact(f"key={STRIPE_FAKE_KEY}")
+        out = redact.redact("key=sk_live_FAKESTRIPEKEYXXXXXXX")
         self.assertIn("[REDACTED:stripe-key]", out)
         self.assertNotIn("sk_live_", out)
 
     def test_openai_key(self):
-        out = redact.redact(f"client with {OPENAI_FAKE_KEY} here")
+        out = redact.redact("client with sk-proj-FAKE_OPENAI_KEY_XXXX here")
         self.assertIn("[REDACTED:openai-key]", out)
-        self.assertNotIn(OPENAI_FAKE_KEY, out)
+        self.assertNotIn("sk-proj-FAKE_OPENAI_KEY_XXXX", out)
 
     def test_jwt(self):
-        out = redact.redact(f"Authorization had {FAKE_JWT} embedded")
+        tok = "eyJFAKE_JWT_000000.eyJFAKE_JWT_000000.FAKE_JWT_000000"
+        out = redact.redact(f"Authorization had {tok} embedded")
         self.assertIn("[REDACTED:jwt]", out)
-        self.assertNotIn(FAKE_JWT, out)
+        self.assertNotIn(tok, out)
 
     def test_bearer(self):
-        out = redact.redact(
-            f"req.Header.Set('Authorization', 'Bearer {BEARER_FAKE_TOKEN}')")
+        out = redact.redact("req.Header.Set('Authorization', 'Bearer FAKE_BEARER_TOKEN_XXXX')")
         self.assertIn("[REDACTED:bearer]", out)
-        self.assertNotIn(BEARER_FAKE_TOKEN, out)
+        self.assertNotIn("FAKE_BEARER_TOKEN_XXXX", out)
 
     def test_url_credentials_redacts_password_only(self):
-        out = redact.redact(
-            f"DATABASE_URL=postgres://appuser:{PG_FAKE_PASSWORD}@db.host:5432/db")
+        out = redact.redact("DATABASE_URL=postgres://appuser:FAKE_DB_PASSWORD@db.host:5432/db")
         self.assertIn("[REDACTED:url-creds]", out)
         self.assertIn("appuser@", out.replace("appuser:[REDACTED:url-creds]@", "appuser@"))
-        self.assertNotIn(PG_FAKE_PASSWORD, out)
+        self.assertNotIn("FAKE_DB_PASSWORD", out)
         # host + port survive
         self.assertIn("db.host:5432", out)
 
@@ -97,15 +70,18 @@ class RedactTests(unittest.TestCase):
         self.assertEqual(redact.redact(s), s)
 
     def test_key_assign(self):
-        out = redact.redact(f'options: {{ api_key: "{GENERIC_FAKE_KEY}" }}')
+        out = redact.redact('options: { api_key: "FAKE_API_KEY_XXXXX" }')
         self.assertIn("[REDACTED:key-assign]", out)
-        self.assertNotIn(GENERIC_FAKE_KEY, out)
+        self.assertNotIn("FAKE_API_KEY_XXXXX", out)
 
     def test_private_key_block(self):
-        out = redact.redact(f"signing key:\n{FAKE_PEM}\nstored")
+        pem = ("-----BEGIN FAKE PRIVATE KEY-----\n"
+               "FAKE_KEY_CONTENT_DO_NOT_USE_00000000\n"
+               "-----END FAKE PRIVATE KEY-----")
+        out = redact.redact(f"signing key:\n{pem}\nstored")
         self.assertIn("[REDACTED:private-key]", out)
-        self.assertNotIn("BEGIN MOCK PRIVATE KEY", out)
-        self.assertNotIn("MOCK PRIVATE KEY", out)
+        self.assertNotIn("BEGIN FAKE PRIVATE KEY", out)
+        self.assertNotIn("FAKE_KEY_CONTENT", out)
 
     # --- non-mangling (false-positive control) ---
     def test_hashes_and_uuids_untouched(self):
@@ -131,14 +107,14 @@ class RedactTests(unittest.TestCase):
     # --- config gating ---
     def test_disabled_when_redact_off(self):
         os.environ["SPECLOOP_REDACT"] = "0"
-        raw = f"key {OPENAI_FAKE_KEY}"
+        raw = "key sk-proj-FAKE_OPENAI_KEY_XXXX"
         self.assertEqual(redact.redact(raw), raw)
         os.environ["SPECLOOP_REDACT"] = "off"
         self.assertEqual(redact.redact(raw), raw)
 
     def test_default_on_when_env_unset(self):
         os.environ.pop("SPECLOOP_REDACT", None)
-        out = redact.redact(f"key {OPENAI_FAKE_KEY}")
+        out = redact.redact("key sk-proj-FAKE_OPENAI_KEY_XXXX")
         self.assertIn("[REDACTED:openai-key]", out)
 
     def test_empty_and_none_safe(self):

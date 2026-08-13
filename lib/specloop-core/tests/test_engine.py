@@ -7,12 +7,6 @@ import unittest
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "scripts"))
 from engine import HashEmbedder, Memory  # noqa: E402
 
-# Fake fixtures — fragmented so no provider-shaped token is a contiguous
-# literal in source (scanners match shape, not content); each reassembles at
-# runtime into a value the redactor matches. All fail provider validation.
-OPENAI_FAKE_KEY  = "sk" + "-proj-" + "A" * 21
-PG_FAKE_PASSWORD = "X" * 18
-
 
 class EngineTests(unittest.TestCase):
     def setUp(self):
@@ -66,17 +60,17 @@ class EngineTests(unittest.TestCase):
 
     def test_index_redacts_secret_in_body(self):
         # redaction is ON by default; an obvious key must not be persisted raw
-        raw = f"deploy with api_key={OPENAI_FAKE_KEY} and go"
+        raw = "deploy with api_key=sk-proj-FAKE_OPENAI_KEY_XXXX and go"
         nid = self.mem.index(self._node(body=raw))
         stored = self.mem.conn.execute(
             "SELECT body FROM nodes WHERE id=?", (nid,)).fetchone()["body"]
-        self.assertNotIn(OPENAI_FAKE_KEY, stored)
+        self.assertNotIn("sk-proj-FAKE_OPENAI_KEY_XXXX", stored)
         self.assertIn("[REDACTED:", stored)
 
     def test_index_redaction_disabled_by_env(self):
         os.environ["SPECLOOP_REDACT"] = "0"
         try:
-            raw = f"key {OPENAI_FAKE_KEY} here"
+            raw = "key sk-proj-FAKE_OPENAI_KEY_XXXX here"
             nid = self.mem.index(self._node(body=raw))
             stored = self.mem.conn.execute(
                 "SELECT body FROM nodes WHERE id=?", (nid,)).fetchone()["body"]
@@ -88,10 +82,10 @@ class EngineTests(unittest.TestCase):
         # query + stored body both scrubbed to the same placeholder space, so a
         # secret-bearing query still recalls the secret-bearing original.
         self.mem.index(self._node(
-            body=f"db url postgres://app:{PG_FAKE_PASSWORD}@host/db conn string"))
-        hits = self.mem.recall(f"postgres://app:{PG_FAKE_PASSWORD}@host/db", k=3)
+            body="db url postgres://app:FAKE_DB_PASSWORD@host/db conn string"))
+        hits = self.mem.recall("postgres://app:FAKE_DB_PASSWORD@host/db", k=3)
         self.assertTrue(hits, "expected a hit with redacted query+body")
-        self.assertNotIn(PG_FAKE_PASSWORD, hits[0]["body"])
+        self.assertNotIn("FAKE_DB_PASSWORD", hits[0]["body"])
 
     def test_history_returns_linked_children(self):
         root = self.mem.index(self._node(id="r", body="build feature X"))
