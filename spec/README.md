@@ -56,7 +56,7 @@ SESSION QUIT (reason=quit)
         └─ store.index(lesson_node)                                      [01]
               ├─ redact(when), redact(body)
               ├─ dedup: WHEN-vector cosine ≥ 0.92?  ──► candidate id     [03]
-              │     no candidate ─► INSERT new lesson (embed=embed(when))
+              │     no candidate ─► INSERT new lesson (embed=embed(redact(when)))
               │     candidate    ─► merge policy:
               │         THENs near-identical? ─► FAST-PATH: confirm-count bump, no LLM
               │         else                 ─► merge_thens (LLM)              [03]
@@ -94,9 +94,11 @@ SESSION START (first prompt only)
    may change without breaking consumers as long as the interface holds.
 2. **Key/payload separation.** The match key (WHEN) is embedded; the payload
    (full rule) is stored and injected. Never embed the payload into the key.
-3. **Graceful degradation.** Every model/embed call is best-effort: a failure
-   disables that touch for the session (audit + notify), never raises into the
-   agent run. Memory is a convenience, not a dependency.
+3. **Graceful degradation.** Every model/embed call is best-effort and never
+   raises into the agent run. Containment is side-specific: **read-side** failure
+   disables recall for the rest of the session; **write-side** failure skips the
+   lesson (or the whole recap) and audits it. Memory is a convenience, not a
+   dependency.
 4. **Grounding.** Lessons must be evidenced by the session transcript; the
    extractor is explicitly told not to invent plausible generalities.
 5. **Stable ids, evolving content.** A merge updates the *existing* node in
@@ -106,11 +108,11 @@ SESSION START (first prompt only)
 
 | From M0 (today) | In M2 | Note |
 |---|---|---|
-| `recap` node type (prose, 1/session) | **frozen** — no new writes | existing nodes read-only; see [07-migration](units/07-migration.md) |
-| `lesson` node type | **new** — the only active write type | WHEN/THEN, embed(WHEN) |
+| `recap` node type (prose, 1/session) | **retired — purged** | DB reset; no recap type remains; see [07-migration](units/07-migration.md) |
+| `lesson` node type | **new — the only type** | WHEN/THEN, embed(WHEN) |
 | dedup on `initial_prompt` vector | **replaced** — dedup on WHEN vector | [03](units/03-dedup-merge.md) |
 | highest-status overwrite (`_maybe_promote`) | **replaced** — two-stage + LLM merge | [03](units/03-dedup-merge.md) |
-| `embedding_prompt` column | **vestigial** for lessons | `embedding` *is* the WHEN vector; column kept for legacy recaps |
+| `embedding_prompt` column + `_migrate`/`_backfill` code | **removed** | recap-prompt-dedup only; lessons use `embedding` for both recall and dedup |
 | `void` / `error` status | **carried over** | void→no nodes; error→no nodes, audit only |
 | `recall` + `formatContext` | **carried over**, renders rules | [06](units/06-read-path.md) |
-| audit log | **carried over**, + `merge` events | [05](units/05-write-path.md) |
+| audit log | mechanism **carried over** (+ `merge` events) | old *file* **purged** — [07](units/07-migration.md) |

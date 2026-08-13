@@ -15,7 +15,6 @@ or models — only nodes, vectors, and types. That blindness is the boundary.
 class Memory:
     def index(self, node: dict) -> str            # insert, or merge onto an existing id
     def recall(self, query: str, k=5, scope="global", type=None) -> list[hit]
-    def history(self, root_id: str) -> list[node]  # a node + everything linked to it
     def count(self, type=None) -> int
 ```
 
@@ -39,17 +38,20 @@ class Memory:
 
 ```
 nodes(
-  id, type, root_prompt_id, project, created,
+  id, type, project, created,
   body,            -- the PAYLOAD (what gets injected on recall)
   meta (json),     -- type-specific structured fields
-  embedding,       -- the MATCH KEY (vector used for cosine + dedup)
-  embedding_prompt -- LEGACY (recap type only); unused by lessons
+  embedding        -- the MATCH KEY (vector used for cosine + dedup)
 )
 ```
 
-Two shapes coexist; only `lesson` is actively written.
+> **Removed vs M0:** the link graph — `root_prompt_id` column, `history()`,
+> `link()` — is gone. Lessons carry provenance in `meta` (see
+> [03](03-dedup-merge.md)), not via node links, so there is nothing to traverse.
 
-### `lesson`  *(the M2 node — new)*
+One node type:
+
+### `lesson`  *(the M2 node — the only type)*
 ```
 body      = "WHEN {when} THEN {then}"            # rendered full rule (payload)
 embedding = embed(redact(when))                  # WHEN clause only (match key + dedup key)
@@ -67,11 +69,6 @@ meta = {
 The WHEN is both the recall key and the dedup key — one vector, two uses, so no
 separate prompt-vector column is needed for this type.
 
-### `recap`  *(legacy — write-frozen)*
-Unchanged from M0 (`references/memory-model.md`): prose body, `embedding =
-embed(body)`, dedup on `initial_prompt`. **No new recap nodes are written.**
-Existing ones remain readable; see [07-migration](07-migration.md).
-
 ## Behaviours carried over unchanged from M0
 
 - **Redaction at the write boundary** — `body` and redact-listed meta fields are
@@ -84,5 +81,5 @@ Existing ones remain readable; see [07-migration](07-migration.md).
 ## Testability
 
 In-memory DB (`Memory(":memory:", HashEmbedder())`) — no files, no network.
-`index`/`recall`/`history`/`count` are pure given a fixed embedder. Dedup/merge
+`index`/`recall`/`count` are pure given a fixed embedder. Dedup/merge
 is exercised by injecting a stub `DedupMerger` (see [03](03-dedup-merge.md) tests).
