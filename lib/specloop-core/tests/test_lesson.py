@@ -5,14 +5,17 @@ No network: a fake Chatter returns canned merge_thens JSON; HashEmbedder gives
 deterministic cosine (identical text ⇒ 1.0; disjoint vocab ⇒ ~0). The Store is a
 real in-memory Memory. Run: python3 test_lesson.py
 """
+import json
 import os
 import sys
 import time
 import unittest
+import uuid
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "scripts"))
 from engine import HashEmbedder, Memory  # noqa: E402
-from lesson import LessonPolicy, MergeOutcome  # noqa: E402
+from lesson import LessonPolicy, MergeOutcome, render_body  # noqa: E402
+import semantic  # noqa: E402
 
 
 class FakeChatter:
@@ -38,12 +41,15 @@ class FakeChatter:
 
 
 def lesson(when, then, session="s1", lstatus="tentative", created=None):
-    """Build a lesson node the way the write path (mem.py) would."""
+    """Build a lesson node the way the write path (mem.py) would. ``then`` is a
+    list[str]; a bare string is accepted too (wrapped to a 1-item list) since
+    most tests here only care about one takeaway."""
+    then_items = [then] if isinstance(then, str) else list(then)
     return {
         "type": "lesson",
-        "body": f"WHEN {when} THEN {then}",
+        "body": render_body(when, then_items),
         "meta": {
-            "when": when, "then": then, "status": lstatus,
+            "when": when, "then": then_items, "status": lstatus,
             "session": session,
             "confirmed_by": [session],
             "merge_count": 0,
@@ -133,7 +139,8 @@ class LessonPolicyTests(unittest.TestCase):
         node = self.mem.get_node(a)
         # body + then reflect the merged THEN; WHEN unchanged
         self.assertIn("prefer piclone", node["body"])
-        self.assertIn("prefer piclone", node["meta"]["then"])
+        self.assertIsInstance(node["meta"]["then"], list)
+        self.assertIn("prefer piclone", node["meta"]["then"][0])
         self.assertEqual(node["meta"]["when"], WHEN)
         # status from the merger; confirmations unioned; merge_count advanced
         self.assertEqual(node["meta"]["status"], "confirmed")
@@ -142,7 +149,7 @@ class LessonPolicyTests(unittest.TestCase):
         # provenance preserves the dropped-then for recovery
         prov = node["meta"]["provenance"]
         self.assertEqual(len(prov), 1)
-        self.assertIn("piclone utility", prov[0]["then"])
+        self.assertIn("piclone utility", prov[0]["then"][0])
         # dropped honoured in the audit detail
         self.assertEqual(self.policy.last_merge["dropped"][0]["item"], "use rpi-clone")
 
@@ -163,6 +170,74 @@ class LessonPolicyTests(unittest.TestCase):
         self.assertEqual(len(node["meta"]["provenance"]), 2)  # s2 + s3 appended
         self.assertEqual(node["meta"]["merge_count"], 2)
 
+    def test_arbiter_call_never_sees_raw_secret_in_new_then(self):
+        # a secret embedded in the NEW lesson's THEN must be redacted before it
+        # reaches the arbiter LLM call, and before it lands in provenance on disk
+        # — regression for a redaction gap in the merge() reconcile path.
+        WHEN = "rotating the deploy key"
+        secret = "sk-proj-FAKE_OPENAI_KEY_FOR_TEST_ONLY_0000000000"
+        self._index(when=WHEN, then="store the key in the vault", session="s1")
+        self.chatter = FakeChatter(
+            '{"same_trigger":true,"then":"store rotated keys in the vault",'
+            '"status":"confirmed","dropped":[]}')
+        self.policy.chatter = self.chatter
+        self._index(when=WHEN, then=f"the working key was {secret}", session="s2")
+        # the secret must never appear in what was sent to the chat API
+        self.assertEqual(len(self.chatter.calls), 1)
+        _, user_payload = self.chatter.calls[0]
+        self.assertNotIn(secret, user_payload)
+        # nor in the persisted provenance trail (nested field a shallow,
+        # key-allowlist meta-redaction wouldn't reach)
+        node = self.mem.get_node(
+            self.mem.conn.execute("SELECT id FROM nodes").fetchone()[0])
+        prov_then = "; ".join(node["meta"]["provenance"][0]["then"])
+        self.assertNotIn(secret, prov_then)
+        self.assertIn("REDACTED", prov_then)
+
+    def test_legacy_string_then_on_existing_node_merges_without_corruption(self):
+        # a node written before THEN became list[str] has a bare string in
+        # meta['then'] on disk. merge() must coerce it, not join it char-by-char
+        # (str is iterable — "; ".join("abc") silently produces "a; b; c").
+        WHEN = "restoring from a backup snapshot"
+        LEGACY_THEN = "verify checksums before restoring"
+        legacy_id = str(uuid.uuid4())
+        self.mem.conn.execute(
+            "INSERT INTO nodes(id,type,project,created,body,meta,embedding) "
+            "VALUES(?,?,?,?,?,?,?)",
+            (legacy_id, "lesson", "proj", time.time(),
+             f"WHEN {WHEN} THEN {LEGACY_THEN}",
+             json.dumps({"when": WHEN, "then": LEGACY_THEN,   # bare string — pre-refactor shape
+                        "status": "tentative", "confirmed_by": ["s0"], "merge_count": 0}),
+             json.dumps(self.mem.embedder.embed(WHEN))))
+        self.mem.conn.commit()
+
+        # same WHEN, same THEN meaning ⇒ should hit the FAST PATH (no LLM call)
+        self._index(when=WHEN, then=LEGACY_THEN, session="s1")
+        self.assertEqual(self.mem.count(), 1)          # merged, not duplicated
+        self.assertEqual(self.mem.last_outcome, "merged:fast")
+        node = self.mem.get_node(legacy_id)
+        self.assertEqual(node["meta"]["then"], [LEGACY_THEN])   # normalized, not char-split
+        self.assertIn(LEGACY_THEN, node["body"])                # rendered cleanly
+        self.assertNotIn(";  ; ", node["body"])                 # no char-join garbage
+
+    def test_merge_result_then_is_capped_at_max_then_items(self):
+        # the model overshoots MAX_THEN_ITEMS ⇒ LessonPolicy stores the capped
+        # list semantic.merge_thens already enforced, not raw model output
+        WHEN = "picking a recall threshold"
+        self._index(when=WHEN, then="start baseline", session="s1")
+        items = [f"item {i}" for i in range(semantic.MAX_THEN_ITEMS + 3)]
+        self.chatter = FakeChatter(semantic.json.dumps(
+            {"same_trigger": True, "then": items, "status": "confirmed", "dropped": []}))
+        self.policy.chatter = self.chatter
+        self._index(when=WHEN, then="a different overshoot-triggering takeaway",
+                    session="s2")
+        node = self.mem.get_node(
+            self.mem.conn.execute("SELECT id FROM nodes").fetchone()[0])
+        self.assertEqual(len(node["meta"]["then"]), semantic.MAX_THEN_ITEMS)
+        self.assertEqual(node["meta"]["then"], items[:semantic.MAX_THEN_ITEMS])
+        # overflow is recorded, not silently dropped
+        self.assertEqual(len(self.policy.last_merge["dropped"]), 3)
+
     def test_authority_uses_merged_status_and_then(self):
         # the merger (canned) resolves the contradiction by authority; the policy
         # trusts res["then"]/res["status"]. Higher-authority side wins.
@@ -178,7 +253,7 @@ class LessonPolicyTests(unittest.TestCase):
         node = self.mem.get_node(
             self.mem.conn.execute("SELECT id FROM nodes").fetchone()[0])
         self.assertEqual(node["meta"]["status"], "confirmed")
-        self.assertIn("mistral-embed", node["meta"]["then"])
+        self.assertIn("mistral-embed", node["meta"]["then"][0])
 
 
 class MultiSessionIntegrationTest(unittest.TestCase):
@@ -218,7 +293,7 @@ class MultiSessionIntegrationTest(unittest.TestCase):
         self.assertEqual(mem.count(), 1)
         self.assertEqual(mem.last_outcome, "merged:llm")
         node = mem.get_node(s1)
-        self.assertIn("prefer piclone", node["meta"]["then"])
+        self.assertIn("prefer piclone", node["meta"]["then"][0])
         self.assertEqual(set(node["meta"]["confirmed_by"]), {"s1", "s2", "s3"})
         self.assertEqual(node["meta"]["merge_count"], 2)
         self.assertEqual(len(node["meta"]["provenance"]), 1)

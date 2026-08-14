@@ -164,11 +164,8 @@ def make_embedder(provider, **overrides):
 
 
 # --------------------------------------------------------------- Storage
-# One node type in M2 (``lesson``), but the Store is deliberately type-agnostic:
-# it persists nodes, ranks by cosine, and routes ``index()`` to a per-type
-# dedup/merge POLICY registered via ``register_policy``. No lesson-specific
-# intelligence lives here (see lesson.py / LessonPolicy) — that is what lets the
-# Store internals change without breaking the policy, and vice versa.
+# Type-agnostic node table; see the Memory class docstring below for the
+# policy-dispatch design this schema backs.
 _SCHEMA = """
 CREATE TABLE IF NOT EXISTS nodes (
     id        TEXT PRIMARY KEY,
@@ -229,22 +226,21 @@ class Memory:
 
     # -- internals ---------------------------------------------------------
     @staticmethod
-    def _cosine(a: Sequence[float], b: Sequence[float]) -> float:
-        # thin wrapper over the module-level cosine (kept for callers/tests).
-        return cosine(a, b)
-
-    # meta string fields that may carry free text (and thus secrets) — scrubbed
-    # at index time alongside the body. See redact.py.
-    _META_REDACT_KEYS = ("when", "then", "summary", "result", "initial_prompt")
-
-    @staticmethod
     def _redact_meta(meta: dict) -> dict:
-        out = dict(meta)
-        for k in Memory._META_REDACT_KEYS:
-            v = out.get(k)
+        """Redact every string value in meta, recursing into nested dicts/lists
+        (e.g. lesson.py's ``provenance`` entries). A per-key allowlist would drift
+        every time a policy adds a new free-text field — recursing over every
+        string leaf doesn't need updating when that happens. Safe to apply
+        broadly: redact() is high-precision by design (see redact.py)."""
+        def scrub(v):
             if isinstance(v, str):
-                out[k] = redact(v)
-        return out
+                return redact(v)
+            if isinstance(v, dict):
+                return {k: scrub(x) for k, x in v.items()}
+            if isinstance(v, list):
+                return [scrub(x) for x in v]
+            return v
+        return scrub(meta)
 
     def _insert(self, node: dict, project: Optional[str]) -> str:
         """Persist a fresh node. Redacts body + listed meta fields, then embeds

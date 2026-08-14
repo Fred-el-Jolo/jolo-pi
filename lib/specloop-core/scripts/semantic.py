@@ -112,6 +112,41 @@ def truncate(text: str, limit: int) -> str:
     return text if len(text) <= limit else text[:limit] + "\n…[truncated]"
 
 
+def env_int(name: str, default: int) -> int:
+    """Read an int from the environment, falling back on unset/blank/invalid.
+    Shared by this module and lesson.py so both cap-enforcing constants
+    (MAX_LESSONS-style, MAX_THEN_ITEMS) parse ``SPECLOOP_*`` overrides the same way."""
+    v = os.environ.get(name)
+    try:
+        return int(v) if v is not None and v.strip() else default
+    except ValueError:
+        return default
+
+
+def env_float(name: str, default: float) -> float:
+    v = os.environ.get(name)
+    try:
+        return float(v) if v is not None and v.strip() else default
+    except ValueError:
+        return default
+
+
+def coerce_then(v) -> list[str]:
+    """Normalize a THEN payload to a list of non-empty strings.
+
+    The prompt asks for a JSON array; a model that ignores the schema and
+    returns a bare string is treated as a 1-item list rather than rejecting the
+    whole lesson/merge over a formatting slip (same trust-but-verify posture as
+    the MAX_LESSONS/MAX_THEN_ITEMS caps below). Public — lesson.py also uses this
+    to normalize THEN on nodes read back from storage, since any row written
+    before THEN became list[str] still has a bare string in the DB."""
+    if isinstance(v, str):
+        v = [v] if v.strip() else []
+    elif not isinstance(v, list):
+        v = []
+    return [s.strip() for s in v if isinstance(s, str) and s.strip()]
+
+
 # --------------------------------------------------------------- write-outs
 # Hard cap lessons per session (unit 02): a ceiling, not a target. The prompt
 # biases toward curation (soft target 3) to suppress padding.
@@ -123,15 +158,16 @@ _LESSON_SYSTEM = (
     "Answer: what was LEARNT that is worth remembering for future similar "
     "situations? Return STRICT JSON only:\n"
     '{"status": "done"|"partial"|"failed"|"void", '
-    '"lessons": [{"when": str, "then": str}]}.\n'
+    '"lessons": [{"when": str, "then": [str, ...]}]}.\n'
     "\n"
     "- status — done=goal accomplished; partial=partly done or drifted; "
     "failed=the work failed; void=nothing durably reusable was learnt.\n"
     "- lessons — 0 to 5 rules.\n"
     "  - when = the situation/trigger that should make future-you recall this. "
     "Be specific (the situation, not the fix).\n"
-    "  - then = the takeaway — an action to take, a fact that holds, or a "
-    "verdict reached.\n"
+    "  - then = the takeaway(s), as a list of 1-3 ATOMIC items — one idea per "
+    "item, not a paragraph: an action to take, a fact that holds, or a verdict "
+    "reached.\n"
     "- Ground every rule in the session's actual work/errors. Do not invent "
     "plausible-sounding generalities. If a rule isn't evidenced by the "
     "transcript, don't emit it.\n"
@@ -143,7 +179,7 @@ _LESSON_SYSTEM = (
 def extract_lessons(chatter: Chatter, initial_prompt: str, digest_json: str) -> dict:
     """Session → 0–5 lessons + a session status (unit 02).
 
-    Returns ``{'status': str, 'lessons': [{'when': str, 'then': str}, ...]}``.
+    Returns ``{'status': str, 'lessons': [{'when': str, 'then': [str, ...]}, ...]}``.
     ``status`` ∈ ``{done, partial, failed, void}``; ``void`` ⇒ ``lessons == []``.
 
     RAISES ``ValueError`` on an unparseable / contract-violating reply (the write
@@ -161,20 +197,26 @@ def extract_lessons(chatter: Chatter, initial_prompt: str, digest_json: str) -> 
         raise ValueError(f"extract_lessons: 'lessons' is not a list: {raw!r}")
     # enforce the hard cap (the prompt asks for ≤5, but trust-but-verify)
     lessons = [l for l in lessons if isinstance(l, dict)][:MAX_LESSONS]
+    for l in lessons:
+        l["then"] = coerce_then(l.get("then"))
     return {"status": data.get("status"), "lessons": lessons}
 
 
+# Hard cap items in a merged THEN — a ceiling enforced below, not just a prompt
+# ask (the model is told this number too, but trust-but-verify: see merge_thens).
+MAX_THEN_ITEMS = env_int("SPECLOOP_MAX_THEN_ITEMS", 6)
+
 _MERGE_SYSTEM = (
     "You reconcile two lessons that may describe the SAME trigger situation.\n"
-    "Inputs: the shared WHEN, and two THEN takeaways — each with an authority "
-    "(status) and an age. Return STRICT JSON:\n"
-    '{"same_trigger": bool, "then": str, "status": str, '
+    "Inputs: the shared WHEN, and two THEN takeaways — each a list of atomic "
+    "items, with an authority (status) and an age. Return STRICT JSON:\n"
+    '{"same_trigger": bool, "then": [str, ...], "status": str, '
     '"dropped": [{"item": str, "reason": str}]}.\n'
     "\n"
     "- same_trigger = false if the two THENs are actually about different "
     "situations — then this is not a merge; the caller keeps them separate and "
     "the other fields are ignored.\n"
-    "- If same trigger, produce ONE merged then that:\n"
+    "- If same trigger, produce ONE merged then LIST that:\n"
     "  1. unions all distinct actionable items from both sides (lossless),\n"
     "  2. removes near-duplicates,\n"
     "  3. resolves contradictions by authority — never keep both sides of a "
@@ -182,9 +224,9 @@ _MERGE_SYSTEM = (
     "confirmed>tentative>contested, then confirm-count, then recency),\n"
     "  4. orders by required dependency first, then efficiency; treat ordered "
     "steps (causal) differently from unordered conditions (a set),\n"
-    "  5. caps at 6 items, dropping only duplicates or the lowest-value item — "
-    "each drop recorded in 'dropped' with a reason; never drop a unique item "
-    "silently.\n"
+    f"  5. caps at {MAX_THEN_ITEMS} items, dropping only duplicates or the "
+    "lowest-value item — each drop recorded in 'dropped' with a reason; never "
+    "drop a unique item silently.\n"
     "- status: confirmed if all sources confirmed; tentative if mixed but "
     "uncontradicted; contested if a contradiction could not be resolved."
 )
@@ -193,8 +235,10 @@ _MERGE_SYSTEM = (
 def merge_thens(chatter: Chatter, when: str, a: dict, b: dict) -> dict:
     """Reconcile two THEN takeaways for the same WHEN trigger (unit 03).
 
-    ``a``/``b`` carry ``{then, status, confirmed_by, date}``. Returns
-    ``{same_trigger: bool, then: str, status: str, dropped: [{item, reason}]}``.
+    ``a``/``b`` carry ``{then: [str, ...], status, confirmed_by, date}``. Returns
+    ``{same_trigger: bool, then: [str, ...], status: str, dropped: [{item, reason}]}``,
+    ``then`` capped at :data:`MAX_THEN_ITEMS` (enforced here, not just asked of the
+    model — overflow items are appended to ``dropped`` rather than silently cut).
     If ``same_trigger`` is False, the caller ignores the other fields and keeps
     the lessons as separate nodes.
 
@@ -208,9 +252,16 @@ def merge_thens(chatter: Chatter, when: str, a: dict, b: dict) -> dict:
     dropped = data.get("dropped") or []
     if not isinstance(dropped, list):
         dropped = []
+    then = coerce_then(data.get("then"))
+    if len(then) > MAX_THEN_ITEMS:
+        overflow, then = then[MAX_THEN_ITEMS:], then[:MAX_THEN_ITEMS]
+        dropped = list(dropped) + [
+            {"item": item, "reason": f"exceeded MAX_THEN_ITEMS={MAX_THEN_ITEMS}, truncated"}
+            for item in overflow
+        ]
     return {
         "same_trigger": bool(data.get("same_trigger")),
-        "then": data.get("then", ""),
+        "then": then,
         "status": data.get("status", "tentative"),
         "dropped": dropped,
     }

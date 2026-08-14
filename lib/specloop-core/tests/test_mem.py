@@ -34,7 +34,9 @@ class ScriptedChatter:
 
 
 def lesson_json(when, then):
-    return {"when": when, "then": then}
+    """``then`` is what extract_lessons would return post-coercion: list[str].
+    Accepts a bare string too (wrapped to a 1-item list) for terser call sites."""
+    return {"when": when, "then": [then] if isinstance(then, str) else list(then)}
 
 
 class RunRecapTests(unittest.TestCase):

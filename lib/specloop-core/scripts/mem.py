@@ -30,7 +30,7 @@ import time
 sys.path.insert(0, os.path.dirname(os.path.realpath(__file__)))
 from engine import HashEmbedder, Memory, PROVIDERS, make_embedder  # noqa: E402
 from semantic import CHATTERS, make_chatter, extract_lessons  # noqa: E402
-from lesson import LessonPolicy  # noqa: E402
+from lesson import LessonPolicy, render_body  # noqa: E402
 import status  # noqa: E402
 from audit import log as audit_log, read as audit_read  # noqa: E402
 from usage import read as usage_read, rollup_by_day, rollup_by_session  # noqa: E402
@@ -219,12 +219,12 @@ def run_recap(m: Memory, chatter, initial_prompt: str, digest: str,
     results = []
     for l in lessons:
         when = (l.get("when") or "").strip()
-        then = (l.get("then") or "").strip()
-        if not when or not then:
+        then_items = l.get("then") or []  # extract_lessons already coerced this to list[str]
+        if not when or not then_items:
             continue
-        body = f"WHEN {when} THEN {then}"
+        body = render_body(when, then_items)
         meta = _stamp({
-            "when": when, "then": then,
+            "when": when, "then": then_items,
             "status": initial,
             "confirmed_by": [session] if session else [],
             "merge_count": 0,

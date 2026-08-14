@@ -14,6 +14,9 @@ The lesson-specific intelligence that the Store dispatches to. The Store (unit
   ``NOT_A_DUP`` (insert separately); else UPDATE the existing node in place with
   the merged THEN, unioned confirmations, and appended provenance.
 
+THEN is a ``list[str]`` of atomic items, not one prose blob — that's what makes
+MAX_THEN_ITEMS (semantic.py) an actual enforceable cap instead of a prompt hint.
+
 Stable ids: a merge updates the *existing* node in place; ids don't churn across
 merges. The WHEN/embedding are deliberately not refined in v1 (see unit 07).
 
@@ -21,12 +24,12 @@ Constants are env-overridable via the ``SPECLOOP_`` prefix where useful.
 """
 from __future__ import annotations
 
-import os
 import time
 from enum import Enum
 
+from engine import cosine
 from redact import redact
-from semantic import merge_thens
+from semantic import coerce_then, env_float, merge_thens
 import status
 
 
@@ -39,42 +42,11 @@ class MergeOutcome(Enum):
     NOT_A_DUP = "not-a-dup"
 
 
-def _env_float(name: str, default: float) -> float:
-    v = os.environ.get(name)
-    try:
-        return float(v) if v is not None and v.strip() else default
-    except ValueError:
-        return default
-
-
-def _env_int(name: str, default: int) -> int:
-    v = os.environ.get(name)
-    try:
-        return int(v) if v is not None and v.strip() else default
-    except ValueError:
-        return default
-
-
 # WHEN-vector cosine to flag a merge candidate. The arbiter makes this forgiving
 # — a false candidate is rejected, so the value can be a little loose.
-LESSON_DEDUP_THRESHOLD = _env_float("SPECLOOP_LESSON_DEDUP_THRESHOLD", 0.92)
+LESSON_DEDUP_THRESHOLD = env_float("SPECLOOP_LESSON_DEDUP_THRESHOLD", 0.92)
 # THEN-vector cosine for the fast path (confirm-count bump, no LLM).
-THEN_IDENTICAL_THRESHOLD = _env_float("SPECLOOP_THEN_IDENTICAL_THRESHOLD", 0.95)
-# hard cap items in a merged THEN (the merger is told this; enforced as a safety net).
-MAX_THEN_ITEMS = _env_int("SPECLOOP_MAX_THEN_ITEMS", 6)
-
-
-def _cosine(a, b):
-    """Local cosine (mirrors engine.cosine) so this policy is unit-testable in
-    isolation without importing the Store module. Same loud dim-mismatch guard."""
-    if len(a) != len(b):
-        raise ValueError(f"embedding dim mismatch: {len(a)} != {len(b)}")
-    dot = na = nb = 0.0
-    for x, y in zip(a, b):
-        dot += x * y
-        na += x * x
-        nb += y * y
-    return dot / (na * nb) ** 0.5 if na and nb else 0.0
+THEN_IDENTICAL_THRESHOLD = env_float("SPECLOOP_THEN_IDENTICAL_THRESHOLD", 0.95)
 
 
 def _union_sessions(*lists) -> list:
@@ -85,6 +57,19 @@ def _union_sessions(*lists) -> list:
             if s not in out:
                 out.append(s)
     return out
+
+
+def _then_text(items: list[str]) -> str:
+    """Join THEN items into one string — cosine needs a single vector per side,
+    so the fast-path comparison and the stored body both go through this."""
+    return "; ".join(items)
+
+
+def render_body(when: str, then_items: list[str]) -> str:
+    """The stored body's canonical WHEN/THEN text. Public (not LessonPolicy-
+    private) because mem.py needs the identical format for a lesson's first
+    insert — one render function, so the two call sites can't drift apart."""
+    return f"WHEN {when} THEN {_then_text(then_items)}"
 
 
 class LessonPolicy:
@@ -121,22 +106,29 @@ class LessonPolicy:
         else reconcile the THENs in place. Sets :attr:`last_merge` for audit."""
         self.last_merge = None
         existing = store.get_node(existing_id)
-        emeta = existing["meta"]
-        cand_then = emeta.get("then", "")
-        new_then = new_node["meta"].get("then", "")
+        emeta = dict(existing["meta"])
+        # legacy-data guard: a node written before THEN became list[str] still
+        # has a bare string here. coerce_then wraps it to a 1-item list so every
+        # read below (fast-path join, reconcile, provenance, render) sees a real
+        # list instead of _then_text silently iterating it character by character.
+        emeta["then"] = coerce_then(emeta.get("then"))
+        cand_then = emeta["then"]                      # already redacted (stored via the Store)
+        # new_node hasn't touched the Store yet (merge() runs before any insert/update),
+        # so its THEN is raw — redact now, before it reaches the embedder or the arbiter LLM.
+        new_then = [redact(t) for t in coerce_then(new_node["meta"].get("then"))]
 
-        # 2. FAST PATH — re-learned the same lesson (THENs already agree)
+        # 1. FAST PATH — re-learned the same lesson (THENs already agree)
         if self._thens_near_identical(cand_then, new_then):
             meta = self._fast_path(emeta, new_node)
             store.update_node(existing_id,
-                              body=self._render(emeta["when"], emeta["then"]), meta=meta)
+                              body=render_body(emeta["when"], emeta["then"]), meta=meta)
             self.last_merge = {
                 "mode": "fast", "same_trigger": None, "dropped": [],
                 "provenance_count": len(emeta.get("provenance", []) or []),
             }
             return MergeOutcome.FAST_PATH
 
-        # 3. ARBITER — are these truly the same trigger situation?
+        # 2. ARBITER — are these truly the same trigger situation?
         res = merge_thens(self.chatter, emeta["when"],
                           self._then_input(existing, cand_then),
                           self._then_input(new_node, new_then))
@@ -144,10 +136,10 @@ class LessonPolicy:
             # different trigger ⇒ NOT a dup; Store inserts the new lesson separately
             return MergeOutcome.NOT_A_DUP
 
-        # 4. RECONCILE — same trigger, THENs differ → update existing in place
-        meta, dropped = self._reconcile(emeta, new_node, res)
+        # 3. RECONCILE — same trigger, THENs differ → update existing in place
+        meta, dropped = self._reconcile(emeta, new_node, res, new_then)
         store.update_node(existing_id,
-                          body=self._render(emeta["when"], res["then"]), meta=meta)
+                          body=render_body(emeta["when"], res["then"]), meta=meta)
         self.last_merge = {
             "mode": "llm", "same_trigger": True, "dropped": dropped,
             "provenance_count": len(meta.get("provenance", []) or []),
@@ -155,20 +147,17 @@ class LessonPolicy:
         return MergeOutcome.MERGED
 
     # -- helpers -----------------------------------------------------------
-    def _thens_near_identical(self, a: str, b: str) -> bool:
-        va = self.embedder.embed(redact(a), purpose="merge")
-        vb = self.embedder.embed(redact(b), purpose="merge")
-        return _cosine(va, vb) >= THEN_IDENTICAL_THRESHOLD
+    def _thens_near_identical(self, a: list[str], b: list[str]) -> bool:
+        # callers pass already-redacted items (see merge()) — no re-redact here
+        va = self.embedder.embed(_then_text(a), purpose="merge")
+        vb = self.embedder.embed(_then_text(b), purpose="merge")
+        return cosine(va, vb) >= THEN_IDENTICAL_THRESHOLD
 
     @staticmethod
-    def _render(when: str, then: str) -> str:
-        return f"WHEN {when} THEN {then}"
-
-    @staticmethod
-    def _then_input(node_or_existing, then_text) -> dict:
+    def _then_input(node_or_existing, then_items: list[str]) -> dict:
         meta = node_or_existing["meta"]
         return {
-            "then": then_text,
+            "then": then_items,
             "status": meta.get("status"),
             "confirmed_by": meta.get("confirmed_by", []) or [],
             "date": node_or_existing.get("created", time.time()),
@@ -185,11 +174,20 @@ class LessonPolicy:
         # then unchanged (near-identical); body + embedding unchanged by the Store
         return meta
 
-    def _reconcile(self, emeta: dict, new_node: dict, res: dict):
-        """Same trigger, THENs differ ⇒ merged THEN + lossless provenance."""
+    def _reconcile(self, emeta: dict, new_node: dict, res: dict, new_then: list[str]):
+        """Same trigger, THENs differ ⇒ merged THEN + lossless provenance.
+
+        ``new_then`` is the already-redacted THEN items (see merge()) — used here
+        instead of ``new_node["meta"]["then"]`` because the raw value already went
+        out to the arbiter LLM call before this method runs; redacting once, at
+        the source, keeps every downstream use (embed, LLM call, provenance)
+        consistent, on top of whatever Memory._redact_meta re-checks at persist
+        time."""
         meta = dict(emeta)
+        # res["then"] is already capped at MAX_THEN_ITEMS (semantic.merge_thens
+        # enforces it, overflow items land in res["dropped"] — real enforcement,
+        # not just a number in the prompt).
         then = res["then"]
-        # safety-net cap: the merger is told MAX_THEN_ITEMS, but trust-but-verify
         dropped = list(res.get("dropped", []) or [])
         meta["then"] = then
         meta["status"] = res.get("status") or status.merged_status(
@@ -199,7 +197,7 @@ class LessonPolicy:
         meta["merge_count"] = emeta.get("merge_count", 0) + 1
         provenance = list(emeta.get("provenance", []) or [])
         provenance.append({
-            "then": new_node["meta"].get("then"),
+            "then": new_then,
             "status": new_node["meta"].get("status"),
             "session": new_node["meta"].get("session"),
             "date": new_node.get("created", time.time()),

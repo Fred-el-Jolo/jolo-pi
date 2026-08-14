@@ -62,10 +62,7 @@ class RecallAndSearchTests(EngineTests):
         # switching embedders mid-DB must NOT silently truncate
         with self.assertRaises(ValueError):
             cosine([1.0] * 3, [1.0] * 4)
-        # _cosine staticmethod still works (backward-compat)
-        with self.assertRaises(ValueError):
-            self.mem._cosine([1.0] * 3, [1.0] * 4)
-        self.assertAlmostEqual(self.mem._cosine([1.0, 0.0], [1.0, 0.0]), 1.0)
+        self.assertAlmostEqual(cosine([1.0, 0.0], [1.0, 0.0]), 1.0)
 
 
 class RedactionTests(EngineTests):
@@ -90,13 +87,28 @@ class RedactionTests(EngineTests):
             os.environ.pop("SPECLOOP_REDACT", None)
 
     def test_index_redacts_secret_in_meta_when(self):
-        # 'when'/'then' are redact-listed meta fields (lesson payload can carry secrets)
+        # meta string fields (lesson payload can carry secrets) are redacted
         raw_when = ("situation with a leaked bearer "
                     "Bearer abcdefghijklmnopqrstuvwxyz123456 token")
         nid = self.mem.index(self._node(meta={"when": raw_when, "then": "x"}))
         stored = self.mem.get_node(nid)["meta"]
         self.assertNotIn("abcdefghijklmnopqrstuvwxyz123456", stored["when"])
         self.assertIn("[REDACTED:", stored["when"])
+
+    def test_index_redacts_secret_nested_in_meta_and_any_key(self):
+        # _redact_meta recurses into nested dicts/lists and isn't limited to a
+        # fixed key allowlist — a secret inside e.g. a provenance-style nested
+        # entry, or under a key nobody special-cased, must still be scrubbed.
+        raw = "Bearer abcdefghijklmnopqrstuvwxyz123456"
+        nid = self.mem.index(self._node(meta={
+            "provenance": [{"then": raw, "session": "s1"}],
+            "some_future_field": raw,
+        }))
+        stored = self.mem.get_node(nid)["meta"]
+        self.assertNotIn("abcdefghijklmnopqrstuvwxyz123456", stored["provenance"][0]["then"])
+        self.assertIn("[REDACTED:", stored["provenance"][0]["then"])
+        self.assertIn("[REDACTED:", stored["some_future_field"])
+        self.assertEqual(stored["provenance"][0]["session"], "s1")  # non-secret untouched
 
 
 class NodeHelperTests(EngineTests):
