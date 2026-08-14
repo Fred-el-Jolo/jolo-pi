@@ -28,8 +28,27 @@ from typing import Optional, Sequence
 
 from httputil import post_json
 from redact import redact
+from usage import log as usage_log
 
-DEDUP_THRESHOLD = 0.92  # recap dedup on the initial-PROMPT vector (§8)
+
+# --------------------------------------------------------------- similarity
+def cosine(a: Sequence[float], b: Sequence[float]) -> float:
+    """Cosine similarity with a loud dim-mismatch guard.
+
+    ``zip`` would truncate to the shorter vector and return plausible-looking
+    garbage scores; the usual cause of a mismatch is switching
+    ``SPECLOOP_PROVIDER`` after data exists (e.g. mistral→hash, 1024→512). Better
+    to fail (the extension catches it and disables recall) than corrupt rank."""
+    if len(a) != len(b):
+        raise ValueError(
+            f"embedding dim mismatch: {len(a)} != {len(b)} "
+            "(switching SPECLOOP_PROVIDER after data exists corrupts recall)")
+    dot = na = nb = 0.0
+    for x, y in zip(a, b):
+        dot += x * y
+        na += x * x
+        nb += y * y
+    return dot / (math.sqrt(na) * math.sqrt(nb)) if na and nb else 0.0
 
 
 # --------------------------------------------------------------- Embedders
@@ -37,7 +56,7 @@ class Embedder:
     name = "base"
     dim = 0
 
-    def embed(self, text: str) -> list[float]:
+    def embed(self, text: str, purpose: str = "embed") -> list[float]:
         raise NotImplementedError
 
 
@@ -54,7 +73,7 @@ class HashEmbedder(Embedder):
     def __init__(self, dim: int = 512):
         self.dim = dim
 
-    def embed(self, text: str) -> list[float]:
+    def embed(self, text: str, purpose: str = "embed") -> list[float]:
         vec = [0.0] * self.dim
         for tok in _tokens(text):
             h = int(hashlib.md5(tok.encode()).hexdigest(), 16)
@@ -65,6 +84,11 @@ class HashEmbedder(Embedder):
 
 def _tokens(text: str) -> list[str]:
     return re.findall(r"[a-z0-9]+", text.lower())
+
+
+# cosine is defined above (module-level) so the dedup/merge policy in lesson.py
+# can reuse it without engine importing lesson (decomposition: the Store owns
+# vector search, the policy owns semantics).
 
 
 # Remote embedding providers — all OpenAI-compatible `/embeddings` endpoints.
@@ -104,20 +128,27 @@ class EmbedderAPI(Embedder):
             raise RuntimeError(
                 f"{key_env} not set (export it to use the '{name}' embedder)")
 
-    def embed(self, text):
+    def embed(self, text, purpose="embed"):
         if text in self._cache:
             return self._cache[text]
-        vec = self._call([text])[0]
+        vec = self._call([text], purpose=purpose)[0]
         if not self.dim:
             self.dim = len(vec)
         self._cache[text] = vec
         return vec
 
-    def _call(self, inputs):
+    def _call(self, inputs, purpose="embed"):
         payload = post_json(self.url,
                             {"Authorization": f"Bearer {self.api_key}"},
                             {"model": self.model, "input": inputs},
                             timeout=30)
+        # log the token cost the API already reports; cache hits never reach here
+        u = payload.get("usage") or {}
+        usage_log({"kind": "embed", "provider": self.name, "model": self.model,
+                   "purpose": purpose,
+                   "prompt_tokens": u.get("prompt_tokens", 0) or 0,
+                   "completion_tokens": 0,
+                   "total_tokens": u.get("total_tokens", 0) or 0})
         # OpenAI-style: {"data":[{"embedding":[...], "index":0}, ...]}
         data = sorted(payload["data"], key=lambda d: d.get("index", 0))
         return [d["embedding"] for d in data]
@@ -133,26 +164,40 @@ def make_embedder(provider, **overrides):
 
 
 # --------------------------------------------------------------- Storage
+# One node type in M2 (``lesson``), but the Store is deliberately type-agnostic:
+# it persists nodes, ranks by cosine, and routes ``index()`` to a per-type
+# dedup/merge POLICY registered via ``register_policy``. No lesson-specific
+# intelligence lives here (see lesson.py / LessonPolicy) — that is what lets the
+# Store internals change without breaking the policy, and vice versa.
 _SCHEMA = """
 CREATE TABLE IF NOT EXISTS nodes (
-    id             TEXT PRIMARY KEY,
-    type           TEXT NOT NULL,
-    root_prompt_id TEXT,
-    project        TEXT,
-    created        REAL NOT NULL,
-    body           TEXT NOT NULL,
-    meta           TEXT NOT NULL DEFAULT '{}',
-    embedding      TEXT NOT NULL,
-    embedding_prompt TEXT
+    id        TEXT PRIMARY KEY,
+    type      TEXT NOT NULL,
+    project   TEXT,
+    created   REAL NOT NULL,
+    body      TEXT NOT NULL,
+    meta      TEXT NOT NULL DEFAULT '{}',
+    embedding TEXT NOT NULL
 );
 CREATE INDEX IF NOT EXISTS idx_type    ON nodes(type);
-CREATE INDEX IF NOT EXISTS idx_root    ON nodes(root_prompt_id);
 CREATE INDEX IF NOT EXISTS idx_project ON nodes(project);
 """
 
 
 class Memory:
-    """The memory graph: one sqlite file, embeddings as JSON (→ vec BLOB later)."""
+    """Flat sqlite node store + linear-scan cosine index (unit 01).
+
+    Knows nothing about lessons, recaps, prompts, or models — only nodes,
+    vectors, and types. ``index()`` dispatches to a per-type policy (registered
+    via :meth:`register_policy`); if no policy is registered for a type, the node
+    is inserted unconditionally. The match key vector is supplied per-type by the
+    policy's ``embedding_text`` (key/payload separation): for a lesson that is the
+    WHEN clause alone.
+
+    Construction takes an **Embedder** (dependency injection):
+    ``Memory(path, embedder, current_project)``. ``HashEmbedder`` (lexical,
+    zero-dep) ships for tests/offline; ``make_embedder("mistral")`` for prod.
+    """
 
     def __init__(self, path: str = ":memory:", embedder: Optional[Embedder] = None,
                  current_project: Optional[str] = None):
@@ -162,112 +207,35 @@ class Memory:
         self.conn.row_factory = sqlite3.Row
         self.conn.executescript(_SCHEMA)
         self.conn.commit()
-        self._migrate()
-        self._backfill_prompt_vectors()
+        self._policies: dict[str, object] = {}
+        # outcome of the most recent index() call, as a stable string the write
+        # path reads for audit: "new" | "merged:fast" | "merged:llm" | "not-a-dup".
+        self.last_outcome = "new"
+
+    # -- policy registry ---------------------------------------------------
+    def register_policy(self, node_type: str, policy) -> None:
+        """Register a dedup/merge policy for a node type.
+
+        Policy protocol (duck-typed; the Store does NOT import it):
+          ``embedding_text(node) -> str``
+              the MATCH KEY text (redacted+embedded by the Store).
+          ``find_candidate(store, node, project) -> str | None``
+              an existing node id to merge onto, or None to insert fresh.
+          ``merge(store, existing_id, new_node) -> MergeOutcome``
+              reconcile in place; returns an enum whose ``.value`` is the outcome
+              string (``merged:fast`` | ``merged:llm`` | ``not-a-dup``). A value of
+              ``not-a-dup`` tells the Store to insert the new node instead."""
+        self._policies[node_type] = policy
 
     # -- internals ---------------------------------------------------------
     @staticmethod
     def _cosine(a: Sequence[float], b: Sequence[float]) -> float:
-        if len(a) != len(b):
-            # Fail loud, not silent: ``zip`` would truncate to the shorter vec
-            # and return plausible-looking garbage scores. The usual cause is
-            # switching SPECLOOP_PROVIDER after data exists (e.g. mistral→hash,
-            # 1024→512). Better to disable recall (the extension catches this)
-            # than to corrupt ranking silently.
-            raise ValueError(
-                f"embedding dim mismatch: {len(a)} != {len(b)} "
-                "(switching SPECLOOP_PROVIDER after data exists corrupts recall)")
-        dot = na = nb = 0.0
-        for x, y in zip(a, b):
-            dot += x * y
-            na += x * x
-            nb += y * y
-        return dot / (math.sqrt(na) * math.sqrt(nb)) if na and nb else 0.0
-
-    def _find_dup(self, ntype: str, prompt: str, project: Optional[str]) -> Optional[str]:
-        """§8: merge a recap whose initial-PROMPT vector is near-identical.
-        Dedup is on the user's ASK (prompt), not the summary body — so a failed
-        attempt and a later partial on the same task merge regardless of how
-        differently their summaries read. Status is ignored at match time; the
-        higher-status summary survives via _maybe_promote."""
-        q = self.embedder.embed(prompt)
-        rows = self.conn.execute(
-            "SELECT id, embedding_prompt FROM nodes WHERE type=? AND project IS ?",
-            (ntype, project)).fetchall()
-        best, best_id = 0.0, None
-        for r in rows:
-            ep = r["embedding_prompt"]
-            if ep is None:
-                continue  # legacy row pre-prompt-dedup — skip until backfilled
-            s = self._cosine(q, json.loads(ep))
-            if s > best:
-                best, best_id = s, r["id"]
-        return best_id if best >= DEDUP_THRESHOLD else None
-
-    # status precedence for dedup survivor selection: the node with the
-    # higher-rank summary wins the merge. ``void`` is never stored (skipped at
-    # cmd_recap), so it's absent; ``error`` ranks lowest so a real summary
-    # always supersedes a crashed attempt.
-    _STATUS_RANK = {"done": 4, "partial": 3, "failed": 2, "error": 1}
-
-    def _maybe_promote(self, dup_id: str, new_meta: dict, new_body: str) -> None:
-        """On prompt-vector merge: if the new recap outranks the existing node's
-        status, overwrite its body+meta with the better summary. Equal or lower
-        rank → keep the existing node unchanged (stable; no churn)."""
-        row = self.conn.execute("SELECT meta FROM nodes WHERE id=?", (dup_id,)).fetchone()
-        if row is None:
-            return
-        old_rank = self._STATUS_RANK.get(
-            (json.loads(row["meta"] or "{}")).get("status"), 0)
-        new_rank = self._STATUS_RANK.get(new_meta.get("status"), 0)
-        if new_rank > old_rank:
-            # body changed → re-embed so recall ranking tracks the NEW summary,
-            # not the stale pre-merge one
-            self.conn.execute(
-                "UPDATE nodes SET body=?, meta=?, embedding=? WHERE id=?",
-                (new_body, json.dumps(new_meta),
-                 json.dumps(self.embedder.embed(new_body)), dup_id))
-            self.conn.commit()
-
-    def _migrate(self) -> None:
-        """Add columns introduced after the initial schema to existing DBs.
-        CREATE TABLE IF NOT EXISTS won't alter an existing table, so patch
-        here. Idempotent: checks PRAGMA table_info before altering."""
-        cols = {r[1] for r in self.conn.execute("PRAGMA table_info(nodes)")}
-        if "embedding_prompt" not in cols:
-            self.conn.execute("ALTER TABLE nodes ADD COLUMN embedding_prompt TEXT")
-            self.conn.commit()
-
-    def _backfill_prompt_vectors(self) -> None:
-        """Populate embedding_prompt for recap rows that predate the column
-        (prompt-vector dedup needs them). Best-effort: an embed failure leaves
-        the row unfilled and _find_dup skips it until the next successful pass.
-        A no-op once all recap rows carry a prompt vector."""
-        rows = self.conn.execute(
-            "SELECT id, meta FROM nodes WHERE type='recap' AND embedding_prompt IS NULL"
-        ).fetchall()
-        for r in rows:
-            try:
-                prompt = (json.loads(r["meta"] or "{}")).get("initial_prompt")
-                if not prompt:
-                    continue
-                vec = self.embedder.embed(prompt)
-                self.conn.execute(
-                    "UPDATE nodes SET embedding_prompt=? WHERE id=?",
-                    (json.dumps(vec), r["id"]))
-            except Exception:
-                continue  # leave for the next pass; never block recall/recap
-        if rows:
-            self.conn.commit()
-
-    # -- public API (the contract facades rely on) -------------------------
-    # Types that dedup-on-write (open-questions §8): one node per distinct
-    # recap — repeating an identical session merges instead of stacking.
-    _DEDUP_TYPES = ("recap",)
+        # thin wrapper over the module-level cosine (kept for callers/tests).
+        return cosine(a, b)
 
     # meta string fields that may carry free text (and thus secrets) — scrubbed
     # at index time alongside the body. See redact.py.
-    _META_REDACT_KEYS = ("summary", "result", "initial_prompt")
+    _META_REDACT_KEYS = ("when", "then", "summary", "result", "initial_prompt")
 
     @staticmethod
     def _redact_meta(meta: dict) -> dict:
@@ -278,92 +246,124 @@ class Memory:
                 out[k] = redact(v)
         return out
 
-    def index(self, node: dict) -> str:
-        """Insert a node (+ embeddings). recap nodes dedup-on-write on the
-        initial-PROMPT vector; the higher-status summary survives a merge.
-        Returns the id used (may be an existing id if merged)."""
+    def _insert(self, node: dict, project: Optional[str]) -> str:
+        """Persist a fresh node. Redacts body + listed meta fields, then embeds
+        the policy's key text (or the body when no policy) for the match vector."""
         ntype = node["type"]
-        project = node.get("project", self.current_project)
+        policy = self._policies.get(ntype)
         body = redact(node["body"])            # write-boundary scrub (redact.py)
         meta = self._redact_meta(node.get("meta", {}))
-
-        if ntype in self._DEDUP_TYPES:
-            # dedup on the prompt vector; fall back to body when meta has no
-            # initial_prompt (manual/test nodes). Status is ignored at match
-            # time — _maybe_promote keeps the higher-ranked summary.
-            prompt = meta.get("initial_prompt") or body
-            dup = self._find_dup(ntype, prompt, project)
-            if dup is not None:
-                self._maybe_promote(dup, meta, body)
-                return dup
-
+        if policy is not None:
+            key = redact(policy.embedding_text(node))   # WHEN-only for lessons
+        else:
+            key = body                                   # fallback: embed the body
+        embedding = self.embedder.embed(key, purpose="index")
         nid = node.get("id") or str(uuid.uuid4())
-        embedding = self.embedder.embed(body)
-        embedding_prompt = None
-        if ntype in self._DEDUP_TYPES:
-            embedding_prompt = self.embedder.embed(meta.get("initial_prompt") or body)
         self.conn.execute(
-            "INSERT INTO nodes(id,type,root_prompt_id,project,created,body,meta,embedding,embedding_prompt) "
-            "VALUES(?,?,?,?,?,?,?,?,?)",
-            (nid, ntype, node.get("root_prompt_id"), project,
-             node.get("created", time.time()), body,
-             json.dumps(meta), json.dumps(embedding),
-             json.dumps(embedding_prompt) if embedding_prompt is not None else None),
+            "INSERT INTO nodes(id,type,project,created,body,meta,embedding) "
+            "VALUES(?,?,?,?,?,?,?)",
+            (nid, ntype, project, node.get("created", time.time()),
+             body, json.dumps(meta), json.dumps(embedding)),
         )
         self.conn.commit()
         return nid
 
-    def link(self, child_id: str, root_prompt_id: str) -> None:
-        self.conn.execute("UPDATE nodes SET root_prompt_id=? WHERE id=?",
-                          (root_prompt_id, child_id))
-        self.conn.commit()
+    # -- public API --------------------------------------------------------
+    def index(self, node: dict) -> str:
+        """Insert a node, or merge onto an existing id via the type's policy.
 
-    def recall(self, query: str, k: int = 5, scope: str = "global",
-               node_type: Optional[str] = None) -> list[dict]:
-        """Top-k nodes by cosine. scope='global' (default, §4) | 'local'
-        (current_project only). node_type filters a type (e.g. 'error'). The
-        query is redacted first so it compares in the same scrubbed space as
-        stored bodies (redact.py)."""
-        q = self.embedder.embed(redact(query))
+        Flow (unit 01 → 03): redact → policy.embedding_text → (find_candidate →
+        policy.merge | insert). Returns the id USED — callers must not assume a
+        new node was created (a merge returns the existing id). Sets
+        :attr:`last_outcome` to the stable outcome string for audit."""
+        self.last_outcome = "new"
+        ntype = node["type"]
+        project = node.get("project", self.current_project)
+        policy = self._policies.get(ntype)
+        if policy is None:
+            return self._insert(node, project)          # no policy → unconditional insert
+        cand = policy.find_candidate(self, node, project)
+        if cand is None:
+            return self._insert(node, project)          # no match → fresh node
+        outcome = policy.merge(self, cand, node)        # MergeOutcome (enum)
+        self.last_outcome = getattr(outcome, "value", "new")
+        if self.last_outcome == "not-a-dup":
+            return self._insert(node, project)          # vector false-positive
+        return cand                                       # merged in place onto existing
+
+    def nearest(self, vec, type: Optional[str] = None, project: Optional[str] = None,
+                k: int = 1, threshold: float = 0.0) -> list[tuple[str, float]]:
+        """Top-k node ids by cosine to ``vec``, each with score ≥ ``threshold``.
+
+        Factored out of :meth:`recall` so the dedup policy can reuse the same
+        cosine scan (no duplicated search, and the policy never touches SQL).
+        ``project=None`` means global (no project filter); a value filters to it."""
         clauses, params = [], []
-        if node_type:
+        if type is not None:
             clauses.append("type=?")
-            params.append(node_type)
-        if scope == "local" and self.current_project:
+            params.append(type)
+        if project is not None:
             clauses.append("project=?")
-            params.append(self.current_project)
-        sql = "SELECT * FROM nodes"
+            params.append(project)
+        sql = "SELECT id, embedding FROM nodes"
         if clauses:
             sql += " WHERE " + " AND ".join(clauses)
         rows = self.conn.execute(sql, params).fetchall()
-
-        scored = sorted(
-            ((self._cosine(q, json.loads(r["embedding"])), r) for r in rows),
-            key=lambda t: t[0], reverse=True,
-        )
-        out = []
-        for score, r in scored[:k]:
-            d = dict(r)
-            d["meta"] = json.loads(r["meta"] or "{}")
-            d.pop("embedding", None)
-            d["_score"] = score
-            out.append(d)
-        return out
-
-    def history(self, root_id: str) -> list[dict]:
-        """A node + everything linked to it (``root_prompt_id == root_id``)."""
-        rows = self.conn.execute(
-            "SELECT * FROM nodes WHERE id=? OR root_prompt_id=? ORDER BY created",
-            (root_id, root_id)).fetchall()
-        out = []
+        scored = []
         for r in rows:
-            d = dict(r)
-            d["meta"] = json.loads(r["meta"] or "{}")
-            d.pop("embedding", None)
-            out.append(d)
+            s = cosine(vec, json.loads(r["embedding"]))
+            if s >= threshold:
+                scored.append((r["id"], s))
+        scored.sort(key=lambda t: t[1], reverse=True)
+        return scored[:k]
+
+    def recall(self, query: str, k: int = 5, scope: str = "global",
+               node_type: Optional[str] = None) -> list[dict]:
+        """Top-k nodes by cosine. scope='global' (default) | 'local'
+        (current_project only). node_type filters a type. The query is redacted
+        first so it compares in the same scrubbed space as stored keys."""
+        q = self.embedder.embed(redact(query), purpose="recall")
+        project = self.current_project if scope == "local" else None
+        hits = self.nearest(q, type=node_type, project=project, k=k, threshold=0.0)
+        out = []
+        for nid, score in hits:
+            node = self.get_node(nid)
+            if node is None:
+                continue
+            node["_score"] = score
+            out.append(node)
         return out
 
-    def count(self) -> int:
+    def get_node(self, id: str) -> Optional[dict]:
+        """Fetch one node (meta parsed, embedding dropped), or None."""
+        r = self.conn.execute("SELECT * FROM nodes WHERE id=?", (id,)).fetchone()
+        if r is None:
+            return None
+        d = dict(r)
+        d["meta"] = json.loads(r["meta"] or "{}")
+        d.pop("embedding", None)
+        return d
+
+    def update_node(self, id: str, body: Optional[str] = None,
+                    meta: Optional[dict] = None) -> None:
+        """Update an existing node's body and/or meta IN PLACE (stable id).
+
+        Used by a policy's merge path. ``body`` and listed meta fields are
+        redacted on write; the embedding is deliberately NOT changed here (a
+        merge evolves the payload, not the match key — see unit 03 §stable id)."""
+        if body is not None:
+            self.conn.execute("UPDATE nodes SET body=? WHERE id=?",
+                              (redact(body), id))
+        if meta is not None:
+            self.conn.execute("UPDATE nodes SET meta=? WHERE id=?",
+                              (json.dumps(self._redact_meta(meta)), id))
+        self.conn.commit()
+
+    def count(self, type: Optional[str] = None) -> int:
+        """Node count, optionally filtered by type."""
+        if type is not None:
+            return self.conn.execute(
+                "SELECT COUNT(*) FROM nodes WHERE type=?", (type,)).fetchone()[0]
         return self.conn.execute("SELECT COUNT(*) FROM nodes").fetchone()[0]
 
     def close(self) -> None:

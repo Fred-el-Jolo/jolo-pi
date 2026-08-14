@@ -29,8 +29,11 @@ import time
 
 sys.path.insert(0, os.path.dirname(os.path.realpath(__file__)))
 from engine import HashEmbedder, Memory, PROVIDERS, make_embedder  # noqa: E402
-from semantic import CHATTERS, make_chatter, summarize_session  # noqa: E402
+from semantic import CHATTERS, make_chatter, extract_lessons  # noqa: E402
+from lesson import LessonPolicy  # noqa: E402
+import status  # noqa: E402
 from audit import log as audit_log, read as audit_read  # noqa: E402
+from usage import read as usage_read, rollup_by_day, rollup_by_session  # noqa: E402
 
 
 def detect_project() -> str:
@@ -82,11 +85,10 @@ def _stamp(meta: dict) -> dict:
 _AUDIT_META_KEYS = ("status",)
 
 
-def _log_write(ntype: str, nid: str, root: str | None = None,
-                merged: bool = False, meta: dict | None = None) -> None:
-    audit_log({"event": "write", "type": ntype, "id": nid, "root": root,
-              "merged": merged,
-              "meta": {k: v for k, v in (meta or {}).items() if k in _AUDIT_META_KEYS}})
+def _log_write(ntype: str, nid: str | None, outcome: str = "new",
+                meta: dict | None = None) -> None:
+    audit_log({"event": "write", "type": ntype, "id": nid, "outcome": outcome,
+              "status": (meta or {}).get("status")})
 
 
 def open_memory(args) -> Memory:
@@ -127,20 +129,11 @@ def cmd_remember(m, args):
     meta = _stamp(meta)
     body = body_for(args.type, args.body, meta)
     before = m.count()
-    nid = m.index({"type": args.type, "body": body, "meta": meta, "root_prompt_id": args.root})
-    merged = m.count() == before
-    _log_write(args.type, nid, root=args.root, merged=merged, meta=meta)
-    print(json.dumps({"id": nid, "merged": merged}) if args.json
-          else f"{nid}{'  (merged — dedup)' if merged else ''}")
-
-
-def cmd_history(m, args):
-    emit(m.history(args.root_id), args)
-
-
-def cmd_link(m, args):
-    m.link(args.child_id, args.root_id)
-    print("ok")
+    nid = m.index({"type": args.type, "body": body, "meta": meta})
+    outcome = "merged" if m.count() == before else "new"
+    _log_write(args.type, nid, outcome=outcome, meta=meta)
+    print(json.dumps({"id": nid, "outcome": outcome}) if args.json
+          else f"{nid}{'  (merged — dedup)' if outcome == 'merged' else ''}")
 
 
 def cmd_stats(m, args):
@@ -190,63 +183,92 @@ def cmd_start(m, args):
           else f"{len(recalls)} recall(s)")
 
 
-def _digest_to_text(initial_prompt: str, digest_json: str) -> str:
-    """Offline fallback: render a terse recap body from the digest (no model)."""
+def run_recap(m: Memory, chatter, initial_prompt: str, digest: str,
+             session: str | None) -> dict:
+    """Core recap flow (unit 05): extract lessons → index each (dedup/merge) →
+    audit. Returns the JSON-able summary dict.
+
+    Memory never breaks the run: an extraction failure ⇒ ``error`` (no nodes,
+    audit); a per-lesson index/merge failure ⇒ skip that lesson and continue;
+    ``void`` ⇒ no nodes, audit only. This owns NONE of the logic — extraction is
+    semantic.extract_lessons, dedup/merge is the LessonPolicy, status is the
+    status module. It only sequences them and writes the audit."""
+    policy = LessonPolicy(m.embedder, chatter)
+    m.register_policy("lesson", policy)
+    warnings: list[str] = []
+
+    # 1. EXTRACT — one chat call for the whole session
     try:
-        d = json.loads(digest_json) if digest_json else {}
-    except json.JSONDecodeError:
-        d = {}
-    prompts = d.get("prompts") or []
-    errors = d.get("errors") or []
-    parts = [initial_prompt]
-    if prompts:
-        parts.append("prompts: " + " | ".join(str(p) for p in prompts))
-    if errors:
-        parts.append("errors: " + " | ".join(str(e) for e in errors))
-    return " ".join(parts)[:1000]
+        res = extract_lessons(chatter, initial_prompt, digest)
+    except Exception as e:  # technical failure ⇒ error, write nothing
+        audit_log({"event": "write", "type": "lesson", "outcome": "error",
+                   "status": "error", "session": session, "error": str(e)})
+        return {"session_status": "error", "lessons": [],
+                "warnings": [f"extract: {e}"]}
+
+    session_status = res.get("status", "partial")
+    lessons = res.get("lessons", []) or []
+
+    # void (or nothing emitted) ⇒ write nothing, audit void
+    if session_status == "void" or not lessons:
+        audit_log({"event": "write", "type": "lesson", "outcome": "void",
+                   "status": session_status, "session": session})
+        return {"session_status": session_status, "lessons": [], "warnings": warnings}
+
+    initial = status.initial_lesson_status(session_status)
+    results = []
+    for l in lessons:
+        when = (l.get("when") or "").strip()
+        then = (l.get("then") or "").strip()
+        if not when or not then:
+            continue
+        body = f"WHEN {when} THEN {then}"
+        meta = _stamp({
+            "when": when, "then": then,
+            "status": initial,
+            "confirmed_by": [session] if session else [],
+            "merge_count": 0,
+        })
+        try:
+            nid = m.index({"type": "lesson", "body": body, "meta": meta})
+            outcome = getattr(m, "last_outcome", "new")
+            stored = m.get_node(nid) or {}
+            final_status = stored.get("meta", {}).get("status", initial)
+            results.append({"id": nid, "status": final_status, "outcome": outcome,
+                            "when": when})
+            audit_log({"event": "write", "type": "lesson", "id": nid,
+                       "outcome": outcome, "status": final_status, "session": session})
+            if outcome in ("merged:fast", "merged:llm") and policy.last_merge:
+                d = policy.last_merge
+                audit_log({"event": "merge", "id": nid, "mode": d.get("mode"),
+                           "same_trigger": d.get("same_trigger"),
+                           "dropped": d.get("dropped", []),
+                           "provenance_count": d.get("provenance_count", 0),
+                           "session": session})
+        except Exception as e:  # one bad lesson doesn't lose the others
+            warnings.append(f"lesson '{when[:40]}': {e}")
+            audit_log({"event": "write", "type": "lesson", "outcome": "skip",
+                       "status": initial, "session": session,
+                       "error": str(e), "when": when[:80]})
+
+    return {"session_status": session_status, "lessons": results, "warnings": warnings}
 
 
 def cmd_recap(m, args):
-    """END (write): summarize the session into one recap node. Reads the session
-    digest as JSON from stdin (or --digest): {prompts:[...], errors:[...]}.
-    The summarizer folds subject-drift into the prose (no separate field).
-    --no-summary skips the model and indexes a body rendered from the digest."""
+    """END (write): extract lessons from the session and index each (dedup/merge).
+    Reads the session digest as JSON from stdin (or --digest):
+    {prompts:[...], errors:[...]}."""
     digest = args.digest if args.digest is not None else (
         sys.stdin.read() if not sys.stdin.isatty() else "{}")
     initial_prompt = args.initial_prompt or "(none)"
-    status = "partial"
-    summary = ""
-    warnings = []
-    if args.no_summary:
-        body = _digest_to_text(initial_prompt, digest)
+    chatter = chatter_from_args(args)
+    out = run_recap(m, chatter, initial_prompt, digest, SESSION)
+    if args.json:
+        print(json.dumps(out, indent=2, default=str))
     else:
-        try:
-            res = summarize_session(chatter_from_args(args), initial_prompt, digest)
-            summary = (res.get("summary") or "").strip()
-            status = res.get("status", "partial")
-            body = summary or status
-        except Exception as e:  # technical failure — flag, don't conflate with semantic partial
-            status = "error"
-            warnings.append(f"summary: {e}")
-            body = initial_prompt
-    meta = _stamp({"status": status, "summary": summary, "initial_prompt": initial_prompt})
-
-    # void = nothing worth remembering: don't pollute the graph. Audit only.
-    if status == "void":
-        _log_write("recap", None, root=None, merged=False, meta=meta)
-        print(json.dumps({"recap_id": None, "status": "void", "merged": False,
-                          "warnings": warnings}, indent=2, default=str) if args.json
-              else "recap=void (not stored)")
-        return
-
-    before = m.count()
-    recap_id = m.index({"type": "recap", "body": body, "meta": meta})
-    merged = m.count() == before
-    _log_write("recap", recap_id, root=recap_id, merged=merged, meta=meta)
-    out = {"recap_id": recap_id, "status": status, "merged": merged, "warnings": warnings}
-    print(json.dumps(out, indent=2, default=str) if args.json
-          else f"recap={recap_id}  status={status}"
-               + (f"  warnings={warnings}" if warnings else ""))
+        n = len(out["lessons"])
+        print(f"recap: {n} lesson(s)  status={out['session_status']}"
+              + (f"  warnings={out['warnings']}" if out["warnings"] else ""))
 
 
 def _audit_detail(d: dict) -> str:
@@ -255,7 +277,11 @@ def _audit_detail(d: dict) -> str:
         return (f"{d.get('phase')} injected={d.get('injected')} "
                 f"hits={len(d.get('hits', []))} chars={d.get('chars')}")
     if e == "write":
-        return f"type={d.get('type')} id={(d.get('id') or '')[:8]} merged={d.get('merged')}"
+        return (f"type={d.get('type')} id={(d.get('id') or '')[:8]} "
+                f"outcome={d.get('outcome')} status={d.get('status')}")
+    if e == "merge":
+        return (f"id={(d.get('id') or '')[:8]} mode={d.get('mode')} "
+                f"same={d.get('same_trigger')} prov={d.get('provenance_count')}")
     if e == "lifecycle":
         return f"state={d.get('state')} {d.get('reason', '')}".rstrip()
     return json.dumps({k: v for k, v in d.items()
@@ -274,6 +300,93 @@ def cmd_audit(m, args):
         ts = time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(d.get("ts", 0)))
         sess = (d.get("session") or "-")[:8]
         print(f"{ts} {sess:<8} {d.get('event', '?'):<10} {_audit_detail(d)}")
+
+
+def _parse_since(s):
+    """'7d' / '12h' / epoch-secs → epoch cutoff (float)."""
+    s = str(s).strip().lower()
+    if s.endswith("d"):
+        mult, n = 86400.0, s[:-1]
+    elif s.endswith("h"):
+        mult, n = 3600.0, s[:-1]
+    else:
+        mult, n = None, s
+    try:
+        val = float(n)
+    except ValueError:
+        raise SystemExit(f"--since: bad value {s!r} (use '7d', '12h', or epoch seconds)")
+    return time.time() - val * mult if mult else val
+
+
+def _usage_default() -> str:
+    v = os.environ.get("SPECLOOP_USAGE")
+    if v and v.strip().lower() not in ("0", "off", "false", "no"):
+        return v
+    return os.path.expanduser("~/.specloop/usage.jsonl")
+
+
+def cmd_tokens(m, args):
+    """API token-usage rollups: per-day totals (default) or per-learning-saved
+    (--by-lesson). Reads the usage log; --by-lesson also reads the audit log to
+    count lessons saved per session. No DB / embedder needed."""
+    up = args.path or _usage_default()
+    since = _parse_since(args.since) if args.since else None
+    rows = usage_read(up, since=since, tail=args.tail)
+    if args.by_lesson:
+        _print_tokens_by_lesson(rows, args)
+    else:
+        _print_tokens_by_day(rows, args)
+
+
+def _print_tokens_by_day(rows, args):
+    days = rollup_by_day(rows)
+    if args.json:
+        print(json.dumps(days, indent=2))
+        return
+    if not days:
+        print("(no usage recorded)")
+        return
+    print(f"{'day':<12} {'chat':>9} {'embed':>9} {'total':>9} {'calls':>6}")
+    tc = te = cc = 0
+    for d in days:
+        tot = d["chat"] + d["embed"]
+        print(f"{d['day']:<12} {d['chat']:>9} {d['embed']:>9} {tot:>9} {d['calls']:>6}")
+        tc += d["chat"]; te += d["embed"]; cc += d["calls"]
+    print(f"{'TOTAL':<12} {tc:>9} {te:>9} {tc + te:>9} {cc:>6}")
+
+
+def _print_tokens_by_lesson(rows, args):
+    sess = rollup_by_session(rows)
+    # lesson counts per session come from the audit log's write events (the
+    # outcomes that produced or refined a node). Joined on the shared session id.
+    ap = (args.audit_path or os.environ.get("SPECLOOP_AUDIT")
+          or os.path.expanduser("~/.specloop/audit.jsonl"))
+    saved = {"new", "not-a-dup", "merged:fast", "merged:llm"}
+    counts: dict[str, int] = {}
+    if os.path.exists(ap):
+        for w in audit_read(ap, event="write"):
+            if w.get("outcome") in saved:
+                s = w.get("session") or "(none)"
+                counts[s] = counts.get(s, 0) + 1
+    out = []
+    for s in sess:
+        n = counts.get(s["session"], 0)
+        total = s["extract"] + s["write"]
+        out.append({"session": s["session"], "lessons": n,
+                    "extract": s["extract"], "write": s["write"], "total": total,
+                    "per_lesson": round(total / n, 1) if n else None})
+    if args.json:
+        print(json.dumps(out, indent=2))
+        return
+    if not out:
+        print("(no write-side usage recorded)")
+        return
+    print(f"{'session':<14} {'lessons':>7} {'extract':>8} {'write':>8} "
+          f"{'total':>8} {'per_lesson':>10}")
+    for o in out:
+        pl = f"{o['per_lesson']}" if o["per_lesson"] is not None else "-"
+        print(f"{o['session'][:14]:<14} {o['lessons']:>7} {o['extract']:>8} "
+              f"{o['write']:>8} {o['total']:>8} {pl:>10}")
 
 
 def main():
@@ -300,16 +413,6 @@ def main():
     p.add_argument("--json", action="store_true")
     p.set_defaults(fn=cmd_remember)
 
-    p = sub.add_parser("history", help="a node + everything linked to it")
-    p.add_argument("root_id")
-    p.add_argument("--json", action="store_true")
-    p.set_defaults(fn=cmd_history)
-
-    p = sub.add_parser("link", help="attach provenance: child -> root")
-    p.add_argument("child_id")
-    p.add_argument("root_id")
-    p.set_defaults(fn=cmd_link)
-
     p = sub.add_parser("stats", help="node counts by type")
     p.add_argument("--json", action="store_true")
     p.set_defaults(fn=cmd_stats)
@@ -326,14 +429,12 @@ def main():
     p.add_argument("--json", action="store_true")
     p.set_defaults(fn=cmd_start)
 
-    p = sub.add_parser("recap", help="END (write): summarize a session into one recap node")
+    p = sub.add_parser("recap", help="END (write): extract lessons from a session and index each")
     p.add_argument("--initial-prompt", required=True,
-                   help="the session's first user prompt (subject anchor)")
+                   help="the session's first user prompt")
     p.add_argument("--digest", help="session digest JSON (default: stdin)")
     p.add_argument("--chat-provider", default=None)
     p.add_argument("--chat-model", default=None)
-    p.add_argument("--no-summary", action="store_true",
-                   help="skip the model call (index a recap node from --digest text only)")
     p.add_argument("--json", action="store_true")
     p.set_defaults(fn=cmd_recap)
 
@@ -346,9 +447,19 @@ def main():
     p.add_argument("--json", action="store_true")
     p.set_defaults(fn=cmd_audit)
 
+    p = sub.add_parser("tokens", help="API token-usage rollups (per-day / per-learning-saved)")
+    p.add_argument("--by-lesson", action="store_true",
+                   help="per-session write-side cost (reads the audit log for lesson counts)")
+    p.add_argument("--since", help="only since: '7d', '12h', or epoch seconds")
+    p.add_argument("--tail", type=int, help="only the last N usage lines")
+    p.add_argument("--path", help="usage log path (default $SPECLOOP_USAGE or ~/.specloop/usage.jsonl)")
+    p.add_argument("--audit-path", help="audit log path for --by-lesson lesson counts")
+    p.add_argument("--json", action="store_true")
+    p.set_defaults(fn=cmd_tokens)
+
     args = ap.parse_args()
-    if args.cmd == "audit":  # no DB / embedder needed
-        cmd_audit(None, args)
+    if args.cmd in ("audit", "tokens"):  # no DB / embedder needed
+        args.fn(None, args)
         return
     try:
         m = open_memory(args)
