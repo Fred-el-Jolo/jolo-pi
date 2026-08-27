@@ -31,6 +31,12 @@ STATUS_RANK = {"confirmed": 3, "tentative": 2, "contested": 1}
 
 # Distinct sessions that must re-learn a tentative lesson before it promotes.
 CONFIRM_TO_CONFIRMED = 2
+# …OR distinct calendar days the lesson was (re-)learned on — the escape hatch
+# for heavily-RESUMED sessions: one pi session spanning several days re-learns
+# under the same session id, so session-count alone never promotes (observed
+# 2026-08-18→08-27: lessons merged 3× by one resumed session stayed prov=1).
+# Re-learning on 3 separate days is independent-enough evidence to confirm.
+CONFIRM_DAYS = 3
 
 
 def initial_lesson_status(session_status: str) -> str:
@@ -45,13 +51,19 @@ def initial_lesson_status(session_status: str) -> str:
     return "tentative"
 
 
-def promote(status: str, confirmed_by_count: int) -> str:
-    """Trend a lesson's status as it gets re-confirmed by distinct sessions.
+def promote(status: str, confirmed_by_count: int, learned_days_count: int | None = None) -> str:
+    """Trend a lesson's status as it gets re-confirmed.
 
-    ``tentative`` ⇒ ``confirmed`` once ``confirmed_by_count >= CONFIRM_TO_CONFIRMED``.
+    ``tentative`` ⇒ ``confirmed`` once EITHER evidence bar is met:
+    ``confirmed_by_count >= CONFIRM_TO_CONFIRMED`` (2 distinct sessions) or
+    ``learned_days_count >= CONFIRM_DAYS`` (3 distinct calendar days — see
+    CONFIRM_DAYS above for why session-count alone is not enough).
     ``confirmed`` stays ``confirmed``; ``contested`` is untouched here (a merge
     left it contested — re-confirmation does not silently clear that)."""
-    if status == "tentative" and confirmed_by_count >= CONFIRM_TO_CONFIRMED:
+    if status == "tentative" and (
+        confirmed_by_count >= CONFIRM_TO_CONFIRMED
+        or (learned_days_count or 0) >= CONFIRM_DAYS
+    ):
         return "confirmed"
     return status
 

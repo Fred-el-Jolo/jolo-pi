@@ -42,7 +42,11 @@ export default function specloopPi(pi: ExtensionAPI) {
 
 	// ---- session: cheap probe (python3 + mem.py path + db). Key check is lazy
 	// (caught on first `start`). Reset per-session recall state here — every
-	// session_start (startup/new/resume/fork/reload) recalls once again. --------
+	// session_start (startup/new/resume/fork/reload) recalls once again.
+	// The probe runs on EVERY start, even after a previous disable: a transient
+	// failure (e.g. reading a file mid-rewrite) must not latch memory off for
+	// the whole process lifetime — if the probe now passes, we re-enable.
+	// ------------------------------------------------------------------------
 	pi.on("session_start", async (_event, ctx) => {
 		recalledThisSession = false;
 		firstPrompt = null;
@@ -51,15 +55,23 @@ export default function specloopPi(pi: ExtensionAPI) {
 		// stamp every audit line + mem.py spawn with the project scope key
 		// (same rule as mem.py's detect_project — git toplevel basename)
 		if (!process.env.SPECLOOP_PROJECT) process.env.SPECLOOP_PROJECT = mem.detectProject();
-		if (!memOk) return;
 		try {
 			mem.run(cfg, ["stats"], { json: true, timeoutMs: 8000 });
-			mem.appendAudit(cfg, sessionId, { event: "lifecycle", state: "enabled" });
-			// crash-safety: re-run recaps whose process died (reboot, killed pi)
-			mem.recoverSpooledRecaps(cfg);
 		} catch (err) {
 			disable(String((err as Error).message || err), ctx);
+			return;
 		}
+		const wasDisabled = !memOk;
+		memOk = true;
+		mem.appendAudit(cfg, sessionId, {
+			event: "lifecycle", state: "enabled",
+			...(wasDisabled ? { recovered: true } : {}),
+		});
+		if (wasDisabled && cfg.notify && ctx?.ui) {
+			ctx.ui.notify("specloop: recovered (previous probe failure was transient)", "info");
+		}
+		// crash-safety: re-run recaps whose process died (reboot, killed pi)
+		try { mem.recoverSpooledRecaps(cfg); } catch { /* best-effort */ }
 	});
 
 	// ---- START (read): recall similar past recaps on the FIRST prompt only ----

@@ -40,10 +40,11 @@ class FakeChatter:
         raise AssertionError("FakeChatter.complete called with no canned reply")
 
 
-def lesson(when, then, session="s1", lstatus="tentative", created=None):
+def lesson(when, then, session="s1", lstatus="tentative", created=None, days=None):
     """Build a lesson node the way the write path (mem.py) would. ``then`` is a
     list[str]; a bare string is accepted too (wrapped to a 1-item list) since
-    most tests here only care about one takeaway."""
+    most tests here only care about one takeaway. ``days`` = learned_days
+    (defaults to one fixed day; promotion via days needs ≥3 distinct)."""
     then_items = [then] if isinstance(then, str) else list(then)
     return {
         "type": "lesson",
@@ -52,6 +53,7 @@ def lesson(when, then, session="s1", lstatus="tentative", created=None):
             "when": when, "then": then_items, "status": lstatus,
             "session": session,
             "confirmed_by": [session],
+            "learned_days": list(days) if days else ["2026-01-01"],
             "merge_count": 0,
         },
         "created": created if created is not None else time.time(),
@@ -105,6 +107,23 @@ class LessonPolicyTests(unittest.TestCase):
         meta = self.mem.get_node(a)["meta"]
         self.assertEqual(meta["confirmed_by"], ["s1"])  # deduped
         self.assertEqual(meta["status"], "tentative")   # still <2 distinct
+
+    def test_resumed_session_confirms_across_distinct_days(self):
+        # heavily-resumed sessions re-learn under the SAME session id, so
+        # session-count alone never promotes; 3 distinct calendar days does
+        WHEN = "previewing a site draft without deploying it live"
+        THEN = "run a local static file server for the build output"
+        a = self._index(when=WHEN, then=THEN, session="s1", days=["2026-08-18"])
+        self._index(when=WHEN, then=THEN, session="s1", days=["2026-08-19"])
+        meta = self.mem.get_node(a)["meta"]
+        self.assertEqual(meta["status"], "tentative")     # 2 days not enough
+        self._index(when=WHEN, then=THEN, session="s1", days=["2026-08-21"])
+        meta = self.mem.get_node(a)["meta"]
+        self.assertEqual(meta["status"], "confirmed")     # 3 distinct days
+        self.assertEqual(meta["confirmed_by"], ["s1"])    # …while still one session
+        self.assertEqual(len(meta["learned_days"]), 3)
+        self.assertEqual(self.policy.last_merge["confirmed_by_count"], 1)
+        self.assertEqual(self.policy.last_merge["learned_days_count"], 3)
 
     # -- 3. arbiter: same_trigger False ⇒ NOT_A_DUP ------------------------
     def test_same_trigger_false_inserts_separate_node(self):

@@ -31,6 +31,7 @@ sys.path.insert(0, os.path.dirname(os.path.realpath(__file__)))
 from engine import HashEmbedder, Memory, PROVIDERS, make_embedder  # noqa: E402
 from semantic import CHATTERS, make_chatter, extract_lessons  # noqa: E402
 from lesson import LessonPolicy, render_body  # noqa: E402
+from redact import redact  # noqa: E402
 import status  # noqa: E402
 from audit import log as audit_log, read as audit_read  # noqa: E402
 from usage import read as usage_read, rollup_by_day, rollup_by_session  # noqa: E402
@@ -227,6 +228,7 @@ def run_recap(m: Memory, chatter, initial_prompt: str, digest: str,
             "when": when, "then": then_items,
             "status": initial,
             "confirmed_by": [session] if session else [],
+            "learned_days": [time.strftime("%Y-%m-%d")],
             "merge_count": 0,
         })
         try:
@@ -298,12 +300,107 @@ def _audit_detail(d: dict) -> str:
         return (f"type={d.get('type')} id={(d.get('id') or '')[:8]} "
                 f"outcome={d.get('outcome')} status={d.get('status')}")
     if e == "merge":
-        return (f"id={(d.get('id') or '')[:8]} mode={d.get('mode')} "
-                f"same={d.get('same_trigger')} prov={d.get('provenance_count')}")
+        detail = (f"id={(d.get('id') or '')[:8]} mode={d.get('mode')} "
+                  f"same={d.get('same_trigger')} prov={d.get('provenance_count')}")
+        if d.get("confirmed_by_count") is not None:
+            detail += f" confirmed={d.get('confirmed_by_count')}"
+        if d.get("learned_days_count") is not None:
+            detail += f" days={d.get('learned_days_count')}"
+        return detail
+    if e == "dedup":
+        return (f"{(d.get('merged') or '')[:8]} into {(d.get('into') or '')[:8]} "
+                f"mode={d.get('mode')} cos={d.get('cos')}")
     if e == "lifecycle":
         return f"state={d.get('state')} {d.get('reason', '')}".rstrip()
     return json.dumps({k: v for k, v in d.items()
                        if k not in ("ts", "event", "session", "project")}, default=str)
+
+
+def cmd_dedup(m, args):
+    """Maintenance: re-run dedup/merge over EXISTING lesson nodes.
+
+    Repairs fragmentation left by older thresholds (e.g. the exact-text-edit
+    family that 0.92/0.82 let accumulate). Dry-run by default — reports
+    candidate pairs (cosine ≥ --threshold, scoped per-node project like
+    write-time dedup). --apply merges each source onto its best candidate via
+    the LessonPolicy (fast path, else the LLM arbiter when a chatter key is
+    available) and DELETES the losing node; arbiter refusals (not-a-dup) and
+    chatter-less arbiter cases are skipped, never force-merged. --apply re-scans
+    in ROUNDS (a merge can free another node's best candidate — the cascade
+    case: A~B merges and deletes B, so C~B must re-find C~A)."""
+    rows = m.conn.execute(
+        "SELECT id, project FROM nodes WHERE type='lesson' ORDER BY created").fetchall()
+    threshold = args.threshold if args.threshold is not None else _lesson_threshold()
+
+    def scan_pairs():
+        pairs, seen = [], set()
+        for r in m.conn.execute(
+                "SELECT id, project FROM nodes WHERE type='lesson' ORDER BY created").fetchall():
+            node = m.get_node(r["id"])
+            when = (node or {}).get("meta", {}).get("when")
+            if not when:
+                continue
+            vec = m.embedder.embed(redact(when), purpose="dedup")
+            hits = m.nearest(vec, type="lesson", project=r["project"] or None,
+                             k=3, threshold=threshold)
+            cand = next(((nid, s) for nid, s in hits if nid != node["id"]), None)
+            if cand:
+                key = tuple(sorted((node["id"], cand[0])))  # A~B == B~A — once
+                if key in seen:
+                    continue
+                seen.add(key)
+                pairs.append((node["id"], cand[0], round(cand[1], 3)))
+        return pairs
+
+    pairs = scan_pairs()
+    if not args.apply:
+        for src, dst, s in pairs:
+            print(f"{src[:8]} ~ {dst[:8]}  cos={s}")
+        print(f"dedup: {len(pairs)} candidate pair(s) [dry-run — pass --apply to merge]")
+        if args.json:
+            print(json.dumps({"pairs": pairs, "applied": False}))
+        return
+    try:
+        chatter = chatter_from_args(args)
+    except Exception:
+        chatter = None  # fast-path merges still work; arbiter cases are skipped
+    policy = LessonPolicy(m.embedder, chatter)
+    m.register_policy("lesson", policy)
+    merged = skipped = 0
+    rounds = 0
+    while pairs and rounds < 5:
+        rounds += 1
+        for src, dst, s in pairs:
+            src_node, dst_node = m.get_node(src), m.get_node(dst)
+            if src_node is None or dst_node is None:
+                skipped += 1  # consumed by an earlier merge this run
+                continue
+            try:
+                outcome = policy.merge(m, dst, src_node)
+                ov = getattr(outcome, "value", outcome)
+            except Exception as e:
+                print(f"dedup: skip {src[:8]}~{dst[:8]}: {e}", file=sys.stderr)
+                skipped += 1
+                continue
+            if ov in ("merged:fast", "merged:llm"):
+                m.delete_node(src)
+                merged += 1
+                audit_log({"event": "dedup", "merged": src, "into": dst,
+                           "mode": ov, "cos": s, "session": SESSION})
+            else:
+                skipped += 1  # arbiter says different trigger — keep both
+        pairs = scan_pairs()  # cascade: deleted nodes free new candidates
+    remaining = m.count(type="lesson")
+    print(f"dedup: {merged} merged, {skipped} skipped ({rounds} round(s)) "
+          f"→ {remaining} lesson(s) remain")
+    if args.json:
+        print(json.dumps({"applied": True, "merged": merged,
+                          "skipped": skipped, "rounds": rounds}))
+
+
+def _lesson_threshold() -> float:
+    import lesson
+    return lesson.LESSON_DEDUP_THRESHOLD
 
 
 def cmd_audit(m, args):
@@ -457,6 +554,17 @@ def main():
     p.add_argument("--chat-model", default=None)
     p.add_argument("--json", action="store_true")
     p.set_defaults(fn=cmd_recap)
+
+    p = sub.add_parser("dedup", help="maintenance: re-run dedup/merge over existing lessons")
+    p.add_argument("--threshold", type=float, default=None,
+                   help="candidate cosine (default: the live LESSON_DEDUP_THRESHOLD)")
+    p.add_argument("--apply", action="store_true",
+                   help="actually merge + delete losers (default: dry-run report)")
+    p.add_argument("--chat-provider", default=None,
+                   help="arbiter chatter for non-fast-path merges (default: env)")
+    p.add_argument("--chat-model", default=None)
+    p.add_argument("--json", action="store_true")
+    p.set_defaults(fn=cmd_dedup)
 
     p = sub.add_parser("audit", help="read the memory audit log (recalls/writes/lifecycle)")
     p.add_argument("--event", help="filter: recall|write|lifecycle")

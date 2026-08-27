@@ -164,6 +164,13 @@ class RedactionTests(EngineTests):
 
 
 class NodeHelperTests(EngineTests):
+    def test_delete_node(self):
+        nid = self.mem.index(self._node(id="a", body="to be removed"))
+        self.assertTrue(self.mem.delete_node(nid))
+        self.assertFalse(self.mem.delete_node(nid))   # already gone
+        self.assertIsNone(self.mem.get_node(nid))
+        self.assertEqual(self.mem.count(), 0)
+
     def test_get_node_returns_none_for_missing(self):
         self.assertIsNone(self.mem.get_node("nope"))
 

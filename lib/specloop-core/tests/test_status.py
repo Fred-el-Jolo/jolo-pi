@@ -30,6 +30,17 @@ class StatusTests(unittest.TestCase):
         self.assertEqual(status.promote("tentative", 1), "tentative")
         self.assertEqual(status.promote("tentative", 0), "tentative")
 
+    def test_promote_tentative_by_distinct_days(self):
+        # the resumed-session escape hatch: same session, re-learned on
+        # CONFIRM_DAYS (3) distinct calendar days ⇒ confirmed
+        self.assertEqual(status.promote("tentative", 1, 3), "confirmed")
+        self.assertEqual(status.promote("tentative", 0, 4), "confirmed")
+        # fewer days (and only one session) is not enough
+        self.assertEqual(status.promote("tentative", 1, 2), "tentative")
+        self.assertEqual(status.promote("tentative", 1, 0), "tentative")
+        # days never downgrade a 2-session confirmation
+        self.assertEqual(status.promote("tentative", 2, 0), "confirmed")
+
     def test_promote_confirmed_stays_confirmed(self):
         self.assertEqual(status.promote("confirmed", 5), "confirmed")
         self.assertEqual(status.promote("confirmed", 0), "confirmed")

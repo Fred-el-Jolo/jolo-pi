@@ -383,6 +383,13 @@ class Memory:
         d.pop("embedding", None)
         return d
 
+    def delete_node(self, id: str) -> bool:
+        """Remove a node (maintenance: `mem dedup` deletes the losing side of a
+        repair merge). Returns True if a row was removed."""
+        cur = self.conn.execute("DELETE FROM nodes WHERE id=?", (id,))
+        self.conn.commit()
+        return cur.rowcount > 0
+
     def update_node(self, id: str, body: Optional[str] = None,
                     meta: Optional[dict] = None) -> None:
         """Update an existing node's body and/or meta IN PLACE (stable id).

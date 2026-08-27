@@ -15,7 +15,7 @@ That's the entire surface. No mid-session recall, no per-error capture, no per-t
 ## The two sides
 
 - **Read side (recall) — fully automatic, once.** On the session's first prompt, embed it, find the top-k similar past recaps, inject the hits above threshold into the system prompt. Pure cosine lookup; no model call on the read side (embeddings live in the engine).
-- **Write side (recap) — one model call, at quit.** The recap is produced by a **dedicated cheap model** (default mistral) that sees the initial prompt + the session digest (how the subject evolved + the errors hit). It extracts **lessons** (`WHEN <situation> THEN <action>`); each is indexed with dedup-on-write. Confirmation is **evidence-based**: every lesson starts `tentative`, and only ≥2 *distinct sessions* re-learning it promote it to `confirmed` (the extractor's `done` verdict used to grant `confirmed` from one session — it no longer can, and the merge arbiter's status suggestion is ignored). If the session did nothing meaningful, it writes nothing useful and dedup-on-write keeps the store clean.
+- **Write side (recap) — one model call, at quit.** The recap is produced by a **dedicated cheap model** (default mistral) that sees the initial prompt + the session digest (how the subject evolved + the errors hit). It extracts **lessons** (`WHEN <situation> THEN <action>`); each is indexed with dedup-on-write. Confirmation is **evidence-based**: every lesson starts `tentative` and promotes to `confirmed` only via ≥2 *distinct sessions* re-learning it **or** ≥3 distinct calendar days (`meta.learned_days`) — the day-bar exists because heavily-resumed pi sessions re-learn under one session id. Neither the extractor's `done` verdict nor the merge arbiter's status suggestion can confirm anything. If the session did nothing meaningful, it writes nothing useful and dedup-on-write keeps the store clean.
 
 **The extension never does HTTP.** Embeddings AND chat both live in the python engine (`engine.py` + `semantic.py`), behind the `mem.py` CLI, sharing one model config (default: mistral). This module only shells out, formats the recall block, builds the digest, and injects/flushes.
 
@@ -49,7 +49,7 @@ Or drop a symlink in `~/.pi/agent/extensions/`, or install as a pi package (see 
 | `SPECLOOP_AUDIT` | `~/.specloop/audit.jsonl` | audit-log path (`0`/`off`/`false` disables) |
 | `SPECLOOP_SESSION` | *(set by the extension)* | pi session id, stamped on every node + audit line (the memory↔session join key) |
 | `SPECLOOP_PROJECT` | *(auto-detected)* | project scope key for audit lines + writes (git toplevel basename; set by the extension at `session_start`) |
-| `SPECLOOP_LESSON_DEDUP_THRESHOLD` | `0.82` | WHEN-cosine to flag a merge candidate (above this the LLM arbiter judges paraphrases; `0.92` proved too strict — near-duplicates accumulated) |
+| `SPECLOOP_LESSON_DEDUP_THRESHOLD` | `0.75` | WHEN-cosine to flag a merge candidate for the LLM arbiter. Measured on the live store: true paraphrases ≥0.729, unrelated pairs ≤0.728 (0.92 and 0.82 both left paraphrases stranded → duplicates accumulated) |
 | `SPECLOOP_MMR_LAMBDA` | `0.7` | recall diversification (1 = pure relevance). Stops near-duplicate lessons monopolizing the top-k |
 | `SPECLOOP_REDACT` | `1` | scrub high-precision secrets at the storage boundary, *before* embedding/persisting. Best-effort. |
 | `SPECLOOP_SCOPE` | `global` | recall scope. `local` = current repo only. |
@@ -78,6 +78,18 @@ mem audit --event recall           # only recalls/injections
 mem audit --session <pi-session>   # one pi session's memory activity
 mem audit --tail 50 --json         # machine-readable
 ```
+
+### Store maintenance
+
+```bash
+mem dedup                # dry-run: report duplicate-candidate pairs (cos ≥ threshold)
+mem dedup --apply        # merge via fast-path/arbiter, delete losers, re-scan in rounds
+```
+
+Repairs fragmentation left by older thresholds; every merge is audited (`dedup`
+events) and losers' THENs survive in the winner's `provenance`. The audit trail
+of bugs found & fixes applied lives in
+[`notes/specloop-audit-log.md`](../../notes/specloop-audit-log.md).
 
 ## Crash recovery (lost recaps)
 

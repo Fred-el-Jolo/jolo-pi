@@ -43,17 +43,28 @@ class MergeOutcome(Enum):
 
 
 # WHEN-vector cosine to flag a merge candidate. The arbiter makes this forgiving
-# — a false candidate is rejected, so the value can be a little loose. 0.92 kept
-# paraphrases of the SAME trigger out of the arbiter entirely (they score
-# ~0.80–0.88) and near-duplicate lessons accumulated; 0.82 lets the LLM judge
-# them — which is exactly what the arbiter is for.
-LESSON_DEDUP_THRESHOLD = env_float("SPECLOOP_LESSON_DEDUP_THRESHOLD", 0.82)
+# — a false candidate is rejected, so the value can be a little loose. Measured
+# on the live store (2026-08-27): true paraphrase pairs score 0.73–0.84 while
+# unrelated pairs top out at 0.728 — 0.75 admits the paraphrase cluster to the
+# arbiter and excludes everything measured unrelated. (0.82 left paraphrases
+# at 0.73–0.81 stranded → duplicate lessons accumulated; 0.92 worse still.)
+LESSON_DEDUP_THRESHOLD = env_float("SPECLOOP_LESSON_DEDUP_THRESHOLD", 0.75)
 # THEN-vector cosine for the fast path (confirm-count bump, no LLM).
 THEN_IDENTICAL_THRESHOLD = env_float("SPECLOOP_THEN_IDENTICAL_THRESHOLD", 0.95)
 
 
 def _union_sessions(*lists) -> list:
     """Union session-id lists, preserving order, deduping distinct ids."""
+    out = []
+    for lst in lists:
+        for s in lst or []:
+            if s not in out:
+                out.append(s)
+    return out
+
+
+def _union_strs(*lists) -> list:
+    """Union arbitrary string lists (e.g. learned_days "YYYY-MM-DD"), ordered."""
     out = []
     for lst in lists:
         for s in lst or []:
@@ -128,6 +139,8 @@ class LessonPolicy:
             self.last_merge = {
                 "mode": "fast", "same_trigger": None, "dropped": [],
                 "provenance_count": len(emeta.get("provenance", []) or []),
+                "confirmed_by_count": len(meta.get("confirmed_by", []) or []),
+                "learned_days_count": len(meta.get("learned_days", []) or []),
             }
             return MergeOutcome.FAST_PATH
 
@@ -146,6 +159,8 @@ class LessonPolicy:
         self.last_merge = {
             "mode": "llm", "same_trigger": True, "dropped": dropped,
             "provenance_count": len(meta.get("provenance", []) or []),
+            "confirmed_by_count": len(meta.get("confirmed_by", []) or []),
+            "learned_days_count": len(meta.get("learned_days", []) or []),
         }
         return MergeOutcome.MERGED
 
@@ -172,8 +187,12 @@ class LessonPolicy:
         confirmed_by = _union_sessions(emeta.get("confirmed_by", []),
                                        new_node["meta"].get("confirmed_by", []))
         meta["confirmed_by"] = confirmed_by
+        learned_days = _union_strs(emeta.get("learned_days", []),
+                                   new_node["meta"].get("learned_days", []))
+        meta["learned_days"] = learned_days
         meta["merge_count"] = emeta.get("merge_count", 0) + 1
-        meta["status"] = status.promote(emeta.get("status", "tentative"), len(confirmed_by))
+        meta["status"] = status.promote(emeta.get("status", "tentative"),
+                                         len(confirmed_by), len(learned_days))
         # then unchanged (near-identical); body + embedding unchanged by the Store
         return meta
 
@@ -198,9 +217,12 @@ class LessonPolicy:
         confirmed_by = _union_sessions(emeta.get("confirmed_by", []),
                                         new_node["meta"].get("confirmed_by", []))
         meta["confirmed_by"] = confirmed_by
+        learned_days = _union_strs(emeta.get("learned_days", []),
+                                   new_node["meta"].get("learned_days", []))
+        meta["learned_days"] = learned_days
         base = status.merged_status([emeta.get("status", "tentative"),
                                      new_node["meta"].get("status", "tentative")])
-        meta["status"] = status.promote(base, len(confirmed_by))
+        meta["status"] = status.promote(base, len(confirmed_by), len(learned_days))
         meta["merge_count"] = emeta.get("merge_count", 0) + 1
         provenance = list(emeta.get("provenance", []) or [])
         provenance.append({

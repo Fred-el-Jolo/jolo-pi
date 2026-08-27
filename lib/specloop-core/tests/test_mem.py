@@ -182,5 +182,60 @@ class RunRecapTests(unittest.TestCase):
         self.assertTrue(any("boom" in w for w in out["warnings"]))
 
 
+class DedupCommandTests(unittest.TestCase):
+    """`mem dedup` repair pass (unit: maintenance). HashEmbedder + identical
+    WHEN/THEN fragments ⇒ fast-path merge, no chatter/LLM needed."""
+
+    def setUp(self):
+        self.db_fd, self.db_path = tempfile.mkstemp(suffix=".db")
+        os.close(self.db_fd)
+        os.environ["SPECLOOP_AUDIT"] = "0"
+        self.mem = Memory(self.db_path, embedder=HashEmbedder(), current_project="proj")
+
+    def tearDown(self):
+        self.mem.close()
+        os.unlink(self.db_path)
+        os.environ.pop("SPECLOOP_AUDIT", None)
+
+    def _node(self, nid, when, then, session):
+        return {"type": "lesson", "id": nid, "project": "proj",
+                "body": mem.render_body(when, [then]),
+                "meta": {"when": when, "then": [then], "status": "tentative",
+                         "confirmed_by": [session], "learned_days": ["2026-08-01"],
+                         "merge_count": 0}}
+
+    def _args(self, apply):
+        import argparse
+        return argparse.Namespace(threshold=None, apply=apply, json=False,
+                                  chat_provider=None, chat_model=None)
+
+    def test_dedup_dry_run_then_apply(self):
+        W = "editing a file with exact text matching whitespace sensitive"
+        T = "verify the exact text and whitespace before replacing"
+        self.mem.index(self._node("dup1", W, T, "s1"))
+        self.mem.index(self._node("dup2", W, T, "s2"))
+        # a THIRD fragment: its dry-run pair targets dup2, but dup2 is consumed
+        # by the first merge — the cascade round must re-find dup3~dup1
+        self.mem.index(self._node("dup3", W, T, "s3"))
+        self.mem.index(self._node("other", "exploring app ideas for a new playground",
+                                  "prototype fast and throw it away", "s4"))
+        self.assertEqual(self.mem.count(type="lesson"), 4)
+        # dry-run: reports pairs, changes nothing
+        import io, contextlib
+        buf = io.StringIO()
+        with contextlib.redirect_stdout(buf):
+            mem.cmd_dedup(self.mem, self._args(apply=False))
+        self.assertIn("candidate pair", buf.getvalue())
+        self.assertEqual(self.mem.count(type="lesson"), 4)
+        # apply: all three fragments collapse onto one node (cascade rounds)
+        with contextlib.redirect_stdout(buf):
+            mem.cmd_dedup(self.mem, self._args(apply=True))
+        self.assertEqual(self.mem.count(type="lesson"), 2)  # one dup + other
+        kept = next(n for n in (self.mem.get_node(x) for x in ("dup1", "dup2", "dup3"))
+                    if n is not None)
+        self.assertIsNotNone(kept)
+        self.assertEqual(set(kept["meta"]["confirmed_by"]), {"s1", "s2", "s3"})
+
+
 if __name__ == "__main__":
     unittest.main()
