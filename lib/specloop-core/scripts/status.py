@@ -36,10 +36,13 @@ CONFIRM_TO_CONFIRMED = 2
 def initial_lesson_status(session_status: str) -> str:
     """Translate a session outcome into a new lesson's initial status.
 
-    ``done`` ⇒ ``confirmed``; ``partial``/``failed`` ⇒ ``tentative``.
-    ``void`` never reaches here (the write path writes nothing for void).
-    Anything else defaults to ``tentative`` (observed but not validated)."""
-    return "confirmed" if session_status == "done" else "tentative"
+    ALWAYS ``tentative``. Confirmation is evidence-based only: a lesson promotes
+    to ``confirmed`` when ≥2 distinct sessions re-learn it (see :func:`promote`).
+    The extractor's ``done`` verdict alone used to grant ``confirmed`` with a
+    single provenance — but that verdict proved unstable (the same session
+    re-recapped after a restart flipped it), so it no longer grants trust.
+    Anything not in SESSION_STATUS also defaults to ``tentative``."""
+    return "tentative"
 
 
 def promote(status: str, confirmed_by_count: int) -> str:

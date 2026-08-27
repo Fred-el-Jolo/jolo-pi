@@ -15,7 +15,7 @@ That's the entire surface. No mid-session recall, no per-error capture, no per-t
 ## The two sides
 
 - **Read side (recall) — fully automatic, once.** On the session's first prompt, embed it, find the top-k similar past recaps, inject the hits above threshold into the system prompt. Pure cosine lookup; no model call on the read side (embeddings live in the engine).
-- **Write side (recap) — one model call, at quit.** The recap is produced by a **dedicated cheap model** (default mistral) that sees the initial prompt + the session digest (how the subject evolved + the errors hit). It writes a single recap node whose summary folds subject-drift into the prose — no separate label. If the session did nothing meaningful, it writes nothing useful and dedup-on-write keeps the store clean.
+- **Write side (recap) — one model call, at quit.** The recap is produced by a **dedicated cheap model** (default mistral) that sees the initial prompt + the session digest (how the subject evolved + the errors hit). It extracts **lessons** (`WHEN <situation> THEN <action>`); each is indexed with dedup-on-write. Confirmation is **evidence-based**: every lesson starts `tentative`, and only ≥2 *distinct sessions* re-learning it promote it to `confirmed` (the extractor's `done` verdict used to grant `confirmed` from one session — it no longer can, and the merge arbiter's status suggestion is ignored). If the session did nothing meaningful, it writes nothing useful and dedup-on-write keeps the store clean.
 
 **The extension never does HTTP.** Embeddings AND chat both live in the python engine (`engine.py` + `semantic.py`), behind the `mem.py` CLI, sharing one model config (default: mistral). This module only shells out, formats the recall block, builds the digest, and injects/flushes.
 
@@ -48,6 +48,9 @@ Or drop a symlink in `~/.pi/agent/extensions/`, or install as a pi package (see 
 | `SPECLOOP_NOTIFY` | `0` | surface recalls/notices via `notify` |
 | `SPECLOOP_AUDIT` | `~/.specloop/audit.jsonl` | audit-log path (`0`/`off`/`false` disables) |
 | `SPECLOOP_SESSION` | *(set by the extension)* | pi session id, stamped on every node + audit line (the memory↔session join key) |
+| `SPECLOOP_PROJECT` | *(auto-detected)* | project scope key for audit lines + writes (git toplevel basename; set by the extension at `session_start`) |
+| `SPECLOOP_LESSON_DEDUP_THRESHOLD` | `0.82` | WHEN-cosine to flag a merge candidate (above this the LLM arbiter judges paraphrases; `0.92` proved too strict — near-duplicates accumulated) |
+| `SPECLOOP_MMR_LAMBDA` | `0.7` | recall diversification (1 = pure relevance). Stops near-duplicate lessons monopolizing the top-k |
 | `SPECLOOP_REDACT` | `1` | scrub high-precision secrets at the storage boundary, *before* embedding/persisting. Best-effort. |
 | `SPECLOOP_SCOPE` | `global` | recall scope. `local` = current repo only. |
 
@@ -62,10 +65,10 @@ Or drop a symlink in `~/.pi/agent/extensions/`, or install as a pi package (see 
 
 ## Auditing
 
-Memory **state** lives in the sqlite DB (`mem history`, `mem export`). Memory **use** — what was recalled/injected, what was written, enable/disable, recap queued — is logged to `~/.specloop/audit.jsonl` by two writers:
+Memory **state** lives in the sqlite DB (`mem export`). Memory **use** — what was recalled/injected, what was written, enable/disable, recap lifecycle — is logged to `~/.specloop/audit.jsonl` by two writers:
 
-- the **extension** logs `recall` (query, hits, scores, whether injected, chars) and `lifecycle` (enabled/disabled/recap_queued + reason);
-- **`mem.py`** logs `write` (every node indexed, incl. merged/dedup).
+- the **extension** logs `recall` (query, `above` = hits ≥ minScore pre-slice, injected hits + scores, chars) and `lifecycle` (`enabled`, `disabled`, `recap_queued` + `total_prompts`/drift/errors, `recap_spawned` + spool name, `shutdown_skipped` + reason for reload/new/resume/fork, `recap_recovered`);
+- **`mem.py`** logs `write` (every node indexed, incl. merged/dedup/void/error) and `merge` (arbiter decisions).
 
 Every line is stamped with `ts`, `session` (the pi session id), and `project`. Inspect:
 
@@ -75,6 +78,16 @@ mem audit --event recall           # only recalls/injections
 mem audit --session <pi-session>   # one pi session's memory activity
 mem audit --tail 50 --json         # machine-readable
 ```
+
+## Crash recovery (lost recaps)
+
+`recap` runs in a detached child, so a killed pi or a reboot used to lose the
+session's recap **silently** (queued + spawned, then nothing). Now the exact
+recap payload is **spooled** to `~/.specloop/spool/<session>-<ts>.json` before
+the spawn, and `mem.py recap --spool-file` unlinks it on *every* exit path
+(void, error, success). A leftover file therefore means the process died — the
+next `session_start` re-runs it (`lifecycle: recap_recovered`). The child's
+stderr is appended to `~/.specloop/recap-errors.log` (previously discarded).
 
 ## File map
 
@@ -91,7 +104,7 @@ Engine + recap summarizer live in [`../../lib/specloop-core/scripts/`](../../lib
 
 ## Verification done
 
-- `python3 specloop-core/tests/test_engine.py` (9) + `test_semantic.py` (8) + `test_audit.py` (5) + `test_redact.py` (16) + `test_http.py` (5) — green.
-- CLI end-to-end (`start` recall → `recap` write → dedup-on-write) offline with the `hash` embedder — green.
+- `python3` test suite: `test_engine.py` (12) + `test_semantic.py` + `test_audit.py` + `test_redact.py` + `test_http.py` + `test_lesson.py` + `test_status.py` + `test_mem.py` + `test_usage.py` — green.
+- CLI end-to-end (`start` recall → `recap` write → dedup-on-write; `--spool-file` unlinked on both the error and success paths) offline with the `hash` embedder — green.
 - `tsc --strict` against pi's type definitions — clean.
-- Extension logic driven through a mock pi: first-prompt recall injects, second prompt is a no-op (once-per-session gate), `session_shutdown{quit}` writes a recap, `session_shutdown{reload}` does not (reason-gated), and `buildDigest` extracts the initial prompt + drift prompts + tool errors correctly — all green.
+- Extension logic driven through a mock pi: first-prompt recall injects (audit carries `above` + `project`), second prompt is a no-op (once-per-session gate), `session_shutdown{reload}` logs `shutdown_skipped` (no recap), `session_shutdown{quit}` logs `recap_queued` (with `total_prompts`) + `recap_spawned` + writes the spool, the child unlinks the spool on completion and logs its write outcome, and a backdated spool file is picked up by `recoverSpooledRecaps` (`recap_recovered`) — all green.

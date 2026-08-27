@@ -67,9 +67,10 @@ class RunRecapTests(unittest.TestCase):
         self.assertEqual(out["session_status"], "done")
         self.assertEqual(len(out["lessons"]), 2)
         self.assertEqual(self.mem.count(type="lesson"), 2)
-        # each lesson reports outcome new + confirmed (session done)
+        # each lesson reports outcome new; status stays tentative — a "done"
+        # session no longer grants confirmed (evidence-only confirmation)
         self.assertEqual(sorted(l["outcome"] for l in out["lessons"]), ["new", "new"])
-        self.assertTrue(all(l["status"] == "confirmed" for l in out["lessons"]))
+        self.assertTrue(all(l["status"] == "tentative" for l in out["lessons"]))
 
     # -- void ⇒ 0 nodes ----------------------------------------------------
     def test_void_writes_nothing(self):

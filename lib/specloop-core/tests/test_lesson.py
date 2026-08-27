@@ -142,7 +142,8 @@ class LessonPolicyTests(unittest.TestCase):
         self.assertIsInstance(node["meta"]["then"], list)
         self.assertIn("prefer piclone", node["meta"]["then"][0])
         self.assertEqual(node["meta"]["when"], WHEN)
-        # status from the merger; confirmations unioned; merge_count advanced
+        # status from EVIDENCE (s1+s2 = 2 distinct sessions ⇒ promote), not from
+        # the merger's canned "confirmed"; confirmations unioned; merge_count advanced
         self.assertEqual(node["meta"]["status"], "confirmed")
         self.assertEqual(set(node["meta"]["confirmed_by"]), {"s1", "s2"})
         self.assertEqual(node["meta"]["merge_count"], 1)
@@ -240,7 +241,8 @@ class LessonPolicyTests(unittest.TestCase):
 
     def test_authority_uses_merged_status_and_then(self):
         # the merger (canned) resolves the contradiction by authority; the policy
-        # trusts res["then"]/res["status"]. Higher-authority side wins.
+        # trusts res["then"] but computes STATUS from evidence. Higher-authority
+        # side wins the THEN text.
         WHEN = "choosing an embedding provider"
         self._index(when=WHEN, then="the old broken recommendation here",
                     session="s1", lstatus="contested")
@@ -254,6 +256,22 @@ class LessonPolicyTests(unittest.TestCase):
             self.mem.conn.execute("SELECT id FROM nodes").fetchone()[0])
         self.assertEqual(node["meta"]["status"], "confirmed")
         self.assertIn("mistral-embed", node["meta"]["then"][0])
+
+    def test_reconcile_cannot_confirm_with_a_single_session(self):
+        # regression: the arbiter suggesting "confirmed" must NOT confirm when
+        # only ONE distinct session has seen the lesson (self-confirmation)
+        WHEN = "previewing a site draft without deploying"
+        a = self._index(when=WHEN, then="run a local static file server",
+                        session="s1", lstatus="tentative")
+        self.chatter = FakeChatter(
+            '{"same_trigger":true,"then":"use a draft deploy preview",'
+            '"status":"confirmed","dropped":[]}')
+        self.policy.chatter = self.chatter
+        self._index(when=WHEN, then="draft preview environment works fine",
+                    session="s1", lstatus="tentative")  # SAME session
+        node = self.mem.get_node(a)
+        self.assertEqual(node["meta"]["status"], "tentative")  # not confirmed
+        self.assertEqual(node["meta"]["confirmed_by"], ["s1"])
 
 
 class MultiSessionIntegrationTest(unittest.TestCase):

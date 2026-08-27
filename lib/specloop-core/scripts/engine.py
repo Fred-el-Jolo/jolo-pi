@@ -20,6 +20,7 @@ from __future__ import annotations
 import hashlib
 import json
 import math
+import os
 import re
 import sqlite3
 import time
@@ -29,6 +30,20 @@ from typing import Optional, Sequence
 from httputil import post_json
 from redact import redact
 from usage import log as usage_log
+
+
+def _env_float(name: str, default: float) -> float:
+    v = os.environ.get(name)
+    try:
+        return float(v) if v is not None and v.strip() else default
+    except ValueError:
+        return default
+
+
+# MMR diversification weight for recall: score = λ·cos(query,d) − (1−λ)·max cos(d,picked).
+# 1.0 = pure relevance (off); 0.7 trades a little relevance so near-duplicate
+# lessons (e.g. the same situation re-learned) don't monopolize the top-k.
+MMR_LAMBDA = _env_float("SPECLOOP_MMR_LAMBDA", 0.7)
 
 
 # --------------------------------------------------------------- similarity
@@ -287,13 +302,12 @@ class Memory:
             return self._insert(node, project)          # vector false-positive
         return cand                                       # merged in place onto existing
 
-    def nearest(self, vec, type: Optional[str] = None, project: Optional[str] = None,
-                k: int = 1, threshold: float = 0.0) -> list[tuple[str, float]]:
-        """Top-k node ids by cosine to ``vec``, each with score ≥ ``threshold``.
+    def _scan(self, vec, type: Optional[str] = None, project: Optional[str] = None,
+              threshold: float = 0.0) -> list[tuple[str, float, list]]:
+        """Full cosine scan → ``[(id, score, embedding)]`` sorted by score desc.
 
-        Factored out of :meth:`recall` so the dedup policy can reuse the same
-        cosine scan (no duplicated search, and the policy never touches SQL).
-        ``project=None`` means global (no project filter); a value filters to it."""
+        Shared by :meth:`nearest` (top-k) and :meth:`recall` (MMR needs the
+        candidate embeddings, not just ids+scores)."""
         clauses, params = [], []
         if type is not None:
             clauses.append("type=?")
@@ -307,22 +321,51 @@ class Memory:
         rows = self.conn.execute(sql, params).fetchall()
         scored = []
         for r in rows:
-            s = cosine(vec, json.loads(r["embedding"]))
+            emb = json.loads(r["embedding"])
+            s = cosine(vec, emb)
             if s >= threshold:
-                scored.append((r["id"], s))
+                scored.append((r["id"], s, emb))
         scored.sort(key=lambda t: t[1], reverse=True)
-        return scored[:k]
+        return scored
+
+    def nearest(self, vec, type: Optional[str] = None, project: Optional[str] = None,
+                k: int = 1, threshold: float = 0.0) -> list[tuple[str, float]]:
+        """Top-k node ids by cosine to ``vec``, each with score ≥ ``threshold``.
+
+        Factored out of :meth:`recall` so the dedup policy can reuse the same
+        cosine scan (no duplicated search, and the policy never touches SQL).
+        ``project=None`` means global (no project filter); a value filters to it."""
+        return [(i, s) for i, s, _ in
+                self._scan(vec, type=type, project=project, threshold=threshold)[:k]]
 
     def recall(self, query: str, k: int = 5, scope: str = "global",
                node_type: Optional[str] = None) -> list[dict]:
-        """Top-k nodes by cosine. scope='global' (default) | 'local'
-        (current_project only). node_type filters a type. The query is redacted
-        first so it compares in the same scrubbed space as stored keys."""
+        """Top-k nodes by cosine, MMR-diversified. scope='global' (default) |
+        'local' (current_project only). node_type filters a type. The query is
+        redacted first so it compares in the same scrubbed space as stored keys.
+
+        Candidates are ranked by ``MMR_LAMBDA·cos(query,d) − (1−MMR_LAMBDA)·max
+        cos(d, picked)`` so a cluster of near-duplicate lessons can't crowd out
+        a distinct-but-slightly-less-relevant one. ``_score`` stays the raw
+        query cosine (honest relevance for thresholds/audit); only the ORDER is
+        diversified. ``SPECLOOP_MMR_LAMBDA=1`` restores pure relevance."""
         q = self.embedder.embed(redact(query), purpose="recall")
         project = self.current_project if scope == "local" else None
-        hits = self.nearest(q, type=node_type, project=project, k=k, threshold=0.0)
+        pool = self._scan(q, type=node_type, project=project, threshold=0.0)
+        picked: list[tuple[str, float, list]] = []
+        while pool and len(picked) < k:
+            if not picked or MMR_LAMBDA >= 1.0:
+                best_i = 0
+            else:
+                best_i, best_v = 0, float("-inf")
+                for i, (_nid, s, emb) in enumerate(pool):
+                    penalty = max(cosine(emb, p[2]) for p in picked)
+                    v = MMR_LAMBDA * s - (1.0 - MMR_LAMBDA) * penalty
+                    if v > best_v:
+                        best_i, best_v = i, v
+            picked.append(pool.pop(best_i))
         out = []
-        for nid, score in hits:
+        for nid, score, _emb in picked:
             node = self.get_node(nid)
             if node is None:
                 continue

@@ -257,12 +257,30 @@ def run_recap(m: Memory, chatter, initial_prompt: str, digest: str,
 def cmd_recap(m, args):
     """END (write): extract lessons from the session and index each (dedup/merge).
     Reads the session digest as JSON from stdin (or --digest):
-    {prompts:[...], errors:[...]}."""
+    {prompts:[...], errors:[...]}.
+
+    With --spool-file: unlink it on ANY exit path (the extension writes the
+    spool before spawning this; completion ⇒ deletion is the crash-recovery
+    contract — a lingering file would be retried every session forever)."""
     digest = args.digest if args.digest is not None else (
         sys.stdin.read() if not sys.stdin.isatty() else "{}")
     initial_prompt = args.initial_prompt or "(none)"
-    chatter = chatter_from_args(args)
-    out = run_recap(m, chatter, initial_prompt, digest, SESSION)
+    try:
+        try:
+            chatter = chatter_from_args(args)
+        except Exception as e:  # bad provider/key — audit it, don't crash silently
+            audit_log({"event": "write", "type": "lesson", "outcome": "error",
+                       "status": "error", "session": SESSION, "error": str(e)})
+            out = {"session_status": "error", "lessons": [],
+                   "warnings": [f"chatter: {e}"]}
+        else:
+            out = run_recap(m, chatter, initial_prompt, digest, SESSION)
+    finally:
+        if getattr(args, "spool_file", None):
+            try:
+                os.unlink(args.spool_file)
+            except OSError:
+                pass
     if args.json:
         print(json.dumps(out, indent=2, default=str))
     else:
@@ -433,6 +451,8 @@ def main():
     p.add_argument("--initial-prompt", required=True,
                    help="the session's first user prompt")
     p.add_argument("--digest", help="session digest JSON (default: stdin)")
+    p.add_argument("--spool-file", dest="spool_file", default=None,
+                   help="crash-recovery spool: unlink when the recap completes")
     p.add_argument("--chat-provider", default=None)
     p.add_argument("--chat-model", default=None)
     p.add_argument("--json", action="store_true")

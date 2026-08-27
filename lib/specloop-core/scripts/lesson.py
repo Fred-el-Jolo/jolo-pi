@@ -43,8 +43,11 @@ class MergeOutcome(Enum):
 
 
 # WHEN-vector cosine to flag a merge candidate. The arbiter makes this forgiving
-# — a false candidate is rejected, so the value can be a little loose.
-LESSON_DEDUP_THRESHOLD = env_float("SPECLOOP_LESSON_DEDUP_THRESHOLD", 0.92)
+# — a false candidate is rejected, so the value can be a little loose. 0.92 kept
+# paraphrases of the SAME trigger out of the arbiter entirely (they score
+# ~0.80–0.88) and near-duplicate lessons accumulated; 0.82 lets the LLM judge
+# them — which is exactly what the arbiter is for.
+LESSON_DEDUP_THRESHOLD = env_float("SPECLOOP_LESSON_DEDUP_THRESHOLD", 0.82)
 # THEN-vector cosine for the fast path (confirm-count bump, no LLM).
 THEN_IDENTICAL_THRESHOLD = env_float("SPECLOOP_THEN_IDENTICAL_THRESHOLD", 0.95)
 
@@ -190,10 +193,14 @@ class LessonPolicy:
         then = res["then"]
         dropped = list(res.get("dropped", []) or [])
         meta["then"] = then
-        meta["status"] = res.get("status") or status.merged_status(
-            [emeta.get("status"), new_node["meta"].get("status")])
-        meta["confirmed_by"] = _union_sessions(emeta.get("confirmed_by", []),
-                                               new_node["meta"].get("confirmed_by", []))
+        # status from EVIDENCE, never from the merger's suggestion — a
+        # single-session merge must not be able to confirm itself
+        confirmed_by = _union_sessions(emeta.get("confirmed_by", []),
+                                        new_node["meta"].get("confirmed_by", []))
+        meta["confirmed_by"] = confirmed_by
+        base = status.merged_status([emeta.get("status", "tentative"),
+                                     new_node["meta"].get("status", "tentative")])
+        meta["status"] = status.promote(base, len(confirmed_by))
         meta["merge_count"] = emeta.get("merge_count", 0) + 1
         provenance = list(emeta.get("provenance", []) or [])
         provenance.append({

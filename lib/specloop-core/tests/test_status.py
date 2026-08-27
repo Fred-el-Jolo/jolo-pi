@@ -10,12 +10,11 @@ import status  # noqa: E402
 
 class StatusTests(unittest.TestCase):
     # -- initial_lesson_status ------------------------------------------------
-    def test_initial_done_to_confirmed(self):
-        self.assertEqual(status.initial_lesson_status("done"), "confirmed")
-
-    def test_initial_partial_failed_to_tentative(self):
-        self.assertEqual(status.initial_lesson_status("partial"), "tentative")
-        self.assertEqual(status.initial_lesson_status("failed"), "tentative")
+    def test_initial_is_always_tentative(self):
+        # evidence-only confirmation: even a "done" session starts tentative;
+        # promotion happens when ≥2 distinct sessions re-learn the lesson
+        for s in ("done", "partial", "failed", "void", "nonsense"):
+            self.assertEqual(status.initial_lesson_status(s), "tentative")
 
     def test_initial_unknown_defaults_tentative(self):
         # void never reaches here in the flow, but the function stays defensive

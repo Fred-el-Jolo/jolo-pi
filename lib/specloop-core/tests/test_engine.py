@@ -35,6 +35,58 @@ class RecallAndSearchTests(EngineTests):
         # _score is attached and sorted descending
         self.assertGreaterEqual(res[0]["_score"], res[1]["_score"])
 
+    def test_recall_mmr_diversifies_near_duplicates(self):
+        # a cluster of near-duplicate nodes must not crowd out a distinct hit:
+        # pure cosine returns a1,a2; MMR trades a little relevance so the
+        # distinct node wins the second slot (hub-node fix).
+        import engine as engine_mod
+        old = engine_mod.MMR_LAMBDA
+        engine_mod.MMR_LAMBDA = 0.7
+        try:
+            vecs = {
+                "q":  [1.0, 0.0, 0.0],
+                "a1": [0.95, 0.312, 0.0],   # best match (cos 0.95)
+                "a2": [0.55, 0.835, 0.0],   # near-dup of a1 (cos 0.78); cos q 0.55
+                "b":  [0.45, 0.0, 0.893],   # distinct (cos q 0.45, cos a1 0.43)
+            }
+            emb = types.SimpleNamespace(
+                embed=lambda text, purpose="recall": vecs[text], dim=3)
+            mem = Memory(":memory:", embedder=emb, current_project="p")
+            for nid in ("a1", "a2", "b"):
+                mem.index(self._node(id=nid, body=nid))
+            res = mem.recall("q", k=2)
+            mem.close()
+            # pure cosine: [a1, a2]; MMR: b (0.7·0.45−0.3·0.43=0.19) edges
+            # a2 (0.7·0.55−0.3·0.78=0.15)
+            self.assertEqual([r["id"] for r in res], ["a1", "b"])
+            # _score stays the RAW query cosine (relevance), not the MMR value
+            self.assertAlmostEqual(res[1]["_score"], 0.45, places=4)
+        finally:
+            engine_mod.MMR_LAMBDA = old
+
+    def test_recall_mmr_off_with_lambda_one(self):
+        # SPECLOOP_MMR_LAMBDA=1 ⇒ pure relevance ordering (MMR disabled)
+        import engine as engine_mod
+        old = engine_mod.MMR_LAMBDA
+        engine_mod.MMR_LAMBDA = 1.0
+        try:
+            vecs = {
+                "q":  [1.0, 0.0, 0.0],
+                "a1": [0.95, 0.312, 0.0],
+                "a2": [0.55, 0.835, 0.0],
+                "b":  [0.45, 0.0, 0.893],
+            }
+            emb = types.SimpleNamespace(
+                embed=lambda text, purpose="recall": vecs[text], dim=3)
+            mem = Memory(":memory:", embedder=emb, current_project="p")
+            for nid in ("a1", "a2", "b"):
+                mem.index(self._node(id=nid, body=nid))
+            res = mem.recall("q", k=2)
+            mem.close()
+            self.assertEqual([r["id"] for r in res], ["a1", "a2"])
+        finally:
+            engine_mod.MMR_LAMBDA = old
+
     def test_scope_local_vs_global(self):
         self.mem.index(self._node(id="a", project="proj-a", body="postgres pool timeout"))
         self.mem.index(self._node(id="b", project="proj-b", body="postgres pool timeout"))

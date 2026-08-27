@@ -14,7 +14,7 @@
  *   recap   summarize the session into one node   (session_shutdown{quit}, background)
  */
 import { spawn, spawnSync } from "node:child_process";
-import { appendFileSync } from "node:fs";
+import { appendFileSync, closeSync, mkdirSync, openSync, readFileSync, readdirSync, statSync, unlinkSync, writeFileSync } from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
 
@@ -62,6 +62,24 @@ export function defaultConfig(extDir: string): Config {
 }
 
 export class MemError extends Error {}
+
+/** Project scope key for audit lines + mem.py spawns (same rule as mem.py's
+ * detect_project: git toplevel basename, else cwd basename). Set once per
+ * session by the extension so audit "project" stops being null everywhere. */
+export function detectProject(): string {
+	try {
+		const r = spawnSync("git", ["rev-parse", "--show-toplevel"], {
+			encoding: "utf8",
+			timeout: 3000,
+		});
+		if (r.status === 0 && (r.stdout || "").trim()) {
+			return path.basename(r.stdout.trim());
+		}
+	} catch {
+		/* not a git repo / git missing → cwd basename */
+	}
+	return path.basename(process.cwd());
+}
 
 /** Low-level sync shell. Throws MemError on any failure. `opts.json` parses stdout. */
 export function run(
@@ -138,28 +156,104 @@ export function start(
 	});
 }
 
+/** State dir that holds the audit log (spool/ + recap-errors.log live there
+ * too — durability is orthogonal to auditing, so it is derived even when the
+ * audit log itself is disabled). */
+export function stateDir(cfg: Config): string {
+	return path.dirname(cfg.auditPath || path.join(os.homedir(), ".specloop", "audit.jsonl"));
+}
+
+/** A spooled recap younger than this is assumed in-flight (another pi may be
+ * writing it right now); older ones are crash leftovers → recover them. */
+export const SPOOL_GRACE_MS = 5 * 60_000;
+
 /** END (write): summarize the session into one recap node — fire-and-forget
  * background process (does the model call). Detached so it survives pi exiting
- * mid-write; unref()'d so it doesn't keep pi's event loop alive. */
+ * mid-write; unref()'d so it doesn't keep pi's event loop alive.
+ *
+ * Crash-safety: before spawning, the exact recap payload is spooled to
+ * `<stateDir>/spool/<session>-<ts>.json` and passed via `--spool-file` — mem.py
+ * unlinks it on ANY exit path, so a leftover file means the process died
+ * (killed pi, reboot) and the next session_start re-runs it. The child's stderr
+ * is appended to `<stateDir>/recap-errors.log` (it was silently discarded
+ * before — lost recaps were undiagnosable). Returns the spool path (or null). */
 export function recapAsync(
 	cfg: Config,
 	initialPrompt: string,
 	digest: Digest,
 	session: string | null = null,
-): void {
-	const child = spawn(
-		cfg.python,
-		[cfg.memPy, "recap", "--initial-prompt", initialPrompt],
-		{
-			stdio: ["pipe", "ignore", "ignore"],
-			env: { ...process.env, ...sessionEnv(cfg, session) },
-			detached: true,
-		},
-	);
-	child.on("error", () => { /* best-effort; nothing captured mid-session to lose */ });
-	child.stdin.write(JSON.stringify(digest));
-	child.stdin.end();
+): string | null {
+	const spoolDir = path.join(stateDir(cfg), "spool");
+	let spoolPath: string | null = null;
+	try {
+		mkdirSync(spoolDir, { recursive: true });
+		spoolPath = path.join(spoolDir, `${session || "unknown"}-${Date.now()}.json`);
+		writeFileSync(spoolPath, JSON.stringify({
+			session,
+			project: process.env.SPECLOOP_PROJECT ?? null,
+			initial_prompt: initialPrompt,
+			digest,
+			queued_at: Date.now(),
+		}));
+	} catch {
+		spoolPath = null; // durability is best-effort; the recap itself still runs
+	}
+	let errFd: number | undefined;
+	try {
+		errFd = openSync(path.join(stateDir(cfg), "recap-errors.log"), "a");
+		appendFileSync(errFd, `[${new Date().toISOString()} ${session || "-"}] recap ${clip(initialPrompt, 60)}\n`);
+	} catch {
+		errFd = undefined;
+	}
+	const args = [cfg.memPy, "recap", "--initial-prompt", initialPrompt];
+	if (spoolPath) args.push("--spool-file", spoolPath);
+	const child = spawn(cfg.python, args, {
+		stdio: ["pipe", "ignore", errFd !== undefined ? errFd : "ignore"],
+		env: { ...process.env, ...sessionEnv(cfg, session) },
+		detached: true,
+	});
+	child.on("error", () => { /* best-effort; the spool file makes it recoverable */ });
+	child.stdin?.write(JSON.stringify(digest));
+	child.stdin?.end();
 	child.unref();
+	if (errFd !== undefined) {
+		try { closeSync(errFd); } catch { /* already closed */ }
+	}
+	return spoolPath;
+}
+
+/** Re-run recaps whose mem.py process died before completing (spool file older
+ * than SPOOL_GRACE_MS). Each recovery spawns a fresh recap (with its own new
+ * spool) and removes the old file. Returns how many were recovered. */
+export function recoverSpooledRecaps(cfg: Config): number {
+	const spoolDir = path.join(stateDir(cfg), "spool");
+	let files: string[];
+	try {
+		files = readdirSync(spoolDir).filter((f) => f.endsWith(".json"));
+	} catch {
+		return 0; // no spool dir yet → nothing to recover
+	}
+	const cutoff = Date.now() - SPOOL_GRACE_MS;
+	let recovered = 0;
+	for (const f of files) {
+		const p = path.join(spoolDir, f);
+		try {
+			if (statSync(p).mtimeMs > cutoff) continue; // likely in-flight right now
+			const data = JSON.parse(readFileSync(p, "utf8"));
+			recapAsync(
+				cfg,
+				String(data.initial_prompt || "(recovered recap)"),
+				data.digest || { initial_prompt: "", prompts: [], errors: [], total_prompts: 0 },
+				data.session ?? null,
+			);
+			unlinkSync(p);
+			recovered++;
+			appendAudit(cfg, data.session ?? null, { event: "lifecycle", state: "recap_recovered", file: f });
+		} catch {
+			/* one bad spool file must not block the others */
+		}
+	}
+	return recovered;
 }
 
 // ---- formatting / extraction (pure) ----
@@ -194,7 +288,12 @@ export function formatContext(cfg: Config, recalls: RecallHit[]): string {
 }
 
 // ---- session digest (built at shutdown from the entry tree) ----
-export type Digest = { initial_prompt: string; prompts: string[]; errors: string[] };
+export type Digest = {
+	initial_prompt: string;
+	prompts: string[]; // later prompts only (the drift signal)
+	errors: string[];
+	total_prompts: number; // ALL user prompts incl. the first (audit/observability)
+};
 
 /** Extract a compact session digest from `sessionManager.getEntries()`: the
  * initial prompt, the later user prompts (how the subject evolved), and the tool
@@ -223,5 +322,6 @@ export function buildDigest(entries: any[]): Digest {
 		initial_prompt: prompts.length ? prompts[0] : "",
 		prompts: prompts.slice(1, 21), // later prompts — the drift signal
 		errors: errors.slice(0, 20),
+		total_prompts: prompts.length,
 	};
 }

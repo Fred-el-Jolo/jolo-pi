@@ -48,10 +48,15 @@ export default function specloopPi(pi: ExtensionAPI) {
 		firstPrompt = null;
 		if (!cfg.enabled) return;
 		sessionId = (ctx as any)?.sessionManager?.getSessionId?.() ?? null;
+		// stamp every audit line + mem.py spawn with the project scope key
+		// (same rule as mem.py's detect_project — git toplevel basename)
+		if (!process.env.SPECLOOP_PROJECT) process.env.SPECLOOP_PROJECT = mem.detectProject();
 		if (!memOk) return;
 		try {
 			mem.run(cfg, ["stats"], { json: true, timeoutMs: 8000 });
 			mem.appendAudit(cfg, sessionId, { event: "lifecycle", state: "enabled" });
+			// crash-safety: re-run recaps whose process died (reboot, killed pi)
+			mem.recoverSpooledRecaps(cfg);
 		} catch (err) {
 			disable(String((err as Error).message || err), ctx);
 		}
@@ -74,10 +79,12 @@ export default function specloopPi(pi: ExtensionAPI) {
 		firstPrompt = prompt;
 
 		const block = mem.formatContext(cfg, recalls);
-		const hits = recalls.filter((r) => (r._score ?? 0) >= cfg.minScore).slice(0, 3);
+		const aboveMin = recalls.filter((r) => (r._score ?? 0) >= cfg.minScore);
+		const hits = aboveMin.slice(0, 3);
 		mem.appendAudit(cfg, sessionId, {
 			event: "recall", phase: "start", query: prompt,
-			k: cfg.k, hits: hits.map((r) => ({ id: r.id, score: +(r._score ?? 0).toFixed(2) })),
+			k: cfg.k, above: aboveMin.length, // pre-slice signal (was hidden before)
+			hits: hits.map((r) => ({ id: r.id, score: +(r._score ?? 0).toFixed(2) })),
 			injected: !!block, chars: block.length,
 		});
 		if (!block) return; // nothing relevant → inject nothing
@@ -88,7 +95,15 @@ export default function specloopPi(pi: ExtensionAPI) {
 	// ---- END (write): one recap when the session quits -----------------------
 	pi.on("session_shutdown", async (event, ctx) => {
 		if (!cfg.enabled || !memOk) return;
-		if ((event as any)?.reason !== "quit") return; // not reload/new/resume/fork
+		const reason = (event as any)?.reason ?? "unknown";
+		if (reason !== "quit") {
+			// reload/new/resume/fork deliberately skip the recap — but say so in
+			// the audit (coverage was previously unverifiable for these sessions)
+			if (firstPrompt) {
+				mem.appendAudit(cfg, sessionId, { event: "lifecycle", state: "shutdown_skipped", reason });
+			}
+			return;
+		}
 		if (!firstPrompt) return; // nothing was recalled → nothing to recap
 
 		const sm = (ctx as any)?.sessionManager;
@@ -99,10 +114,17 @@ export default function specloopPi(pi: ExtensionAPI) {
 
 		mem.appendAudit(cfg, sessionId, {
 			event: "lifecycle", state: "recap_queued",
-			prompts: digest.prompts.length, errors: digest.errors.length,
+			prompts: digest.prompts.length, total_prompts: digest.total_prompts,
+			errors: digest.errors.length,
 		});
 		try {
-			mem.recapAsync(cfg, initialPrompt, digest, sessionId);
+			const spool = mem.recapAsync(cfg, initialPrompt, digest, sessionId);
+			// distinguish "spawned" from "completed" — a queued+spawned recap
+			// with no write events afterwards is now diagnosable (spool/audit)
+			mem.appendAudit(cfg, sessionId, {
+				event: "lifecycle", state: "recap_spawned",
+				spool: spool ? path.basename(spool) : null,
+			});
 			if (cfg.notify) ctx.ui.notify("specloop: saving session recap…", "info");
 		} catch {
 			/* best-effort; fire-and-forget */
