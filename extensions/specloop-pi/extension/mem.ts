@@ -28,6 +28,9 @@ export type Config = {
 	notify: boolean;
 	audit: boolean;
 	auditPath: string | null;
+	confirm: "ask" | "auto"; // ask = show candidates, insert only the checked ones
+	recallTimeoutMs: number; // hard cap on the recall spawn (before_agent_start blocker)
+	pickTimeoutMs: number; // auto-skip the validation picker after this long (0 = off)
 };
 
 const TRUE = ["1", "true", "yes", "on"];
@@ -58,6 +61,9 @@ export function defaultConfig(extDir: string): Config {
 		notify: bool(env.SPECLOOP_NOTIFY, false),
 		audit: auditPath !== null,
 		auditPath,
+		confirm: (env.SPECLOOP_CONFIRM || "ask").toLowerCase() === "auto" ? "auto" : "ask",
+		recallTimeoutMs: Math.max(1000, parseInt(env.SPECLOOP_RECALL_TIMEOUT_MS || "6000", 10) || 6000),
+		pickTimeoutMs: Math.max(0, parseInt(env.SPECLOOP_PICK_TIMEOUT_MS || "0", 10) || 0),
 	};
 }
 
@@ -152,7 +158,7 @@ export function start(
 	return run(cfg, ["start", prompt, "-k", String(cfg.k)], {
 		env: sessionEnv(cfg, session),
 		json: true,
-		timeoutMs: 6000, // recall blocks before_agent_start — best-effort; a miss must not stall the run
+		timeoutMs: cfg.recallTimeoutMs, // recall blocks before_agent_start — best-effort; a miss must not stall the run
 	});
 }
 

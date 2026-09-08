@@ -5,8 +5,11 @@
  * prompt, ONE recap when the session quits. Nothing per-turn, nothing per-error.
  *
  *   session_start        → health probe (no memory op); reset per-session state
- *   before_agent_start   → on the FIRST prompt only: recall similar past recaps
- *                          and inject them into the system prompt (read-only)
+ *   before_agent_start   → on the FIRST prompt only: recall similar past recaps,
+ *                          show them as a checkable list (TUI picker; nothing
+ *                          enters context yet) and insert ONLY the checked ones
+ *                          as a persistent session message (visible once in the
+ *                          transcript, in LLM context for the whole session)
  *   session_shutdown     → on reason "quit": build a digest from the session
  *                          transcript and write one recap node (background)
  *
@@ -20,9 +23,11 @@
  * injects/flushes.
  */
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
+import { Text } from "@earendil-works/pi-tui";
 import { fileURLToPath } from "node:url";
 import * as path from "node:path";
 import * as mem from "./mem.ts";
+import { confirmGate } from "./picker.ts";
 
 export default function specloopPi(pi: ExtensionAPI) {
 	const extDir = path.dirname(fileURLToPath(import.meta.url));
@@ -74,7 +79,32 @@ export default function specloopPi(pi: ExtensionAPI) {
 		try { mem.recoverSpooledRecaps(cfg); } catch { /* best-effort */ }
 	});
 
-	// ---- START (read): recall similar past recaps on the FIRST prompt only ----
+	// ---- compact transcript rendering of an inserted recall block ----------
+	// The injected message is displayed ONCE, at its position (right after the
+	// first prompt) — it never re-renders on later messages. Collapsed: one
+	// summary line; expanded: the exact text the LLM sees.
+	pi.registerMessageRenderer("specloop-recall", (message: any, options: any, theme: any) => {
+		const { expanded, outputPad } = options ?? {};
+		const details = (message.details ?? {}) as { scores?: number[] };
+		const scores = details.scores ?? [];
+		const n = scores.length;
+		let head = theme.fg("accent", `specloop: ${n} related memor${n === 1 ? "y" : "ies"} inserted`);
+		if (n) head += theme.fg("dim", ` (${scores.map((s) => s.toFixed(2)).join(", ")})`);
+		if (!expanded) head += theme.fg("dim", " · expand for full text");
+		const lines = [head];
+		if (expanded) {
+			for (const l of String(message.content ?? "").split("\n")) {
+				lines.push(theme.fg("muted", l));
+			}
+		}
+		return new Text(lines.join("\n"), outputPad ?? 1, 0);
+	});
+
+	// ---- START (read): recall on the FIRST prompt, insert what the user checks -
+	// Nothing is loaded into LLM context before validation: the picker renders
+	// in the terminal only, and the injection happens solely through this
+	// handler's return value (built from the checked subset). Esc → insert
+	// nothing (and don't re-ask this session).
 	pi.on("before_agent_start", async (event, ctx) => {
 		if (!cfg.enabled || !memOk || recalledThisSession) return;
 		const prompt = (event.prompt || "").trim();
@@ -90,18 +120,52 @@ export default function specloopPi(pi: ExtensionAPI) {
 		recalledThisSession = true;
 		firstPrompt = prompt;
 
-		const block = mem.formatContext(cfg, recalls);
-		const aboveMin = recalls.filter((r) => (r._score ?? 0) >= cfg.minScore);
+		const aboveMin = recalls.filter((r) => (r._score ?? 0) >= cfg.minScore && r.body);
 		const hits = aboveMin.slice(0, 3);
+		if (!hits.length) {
+			mem.appendAudit(cfg, sessionId, {
+				event: "recall", phase: "start", query: prompt,
+				k: cfg.k, above: 0, mode: cfg.confirm, cancelled: false,
+				hits: [], injected: false, chars: 0, vehicle: "message",
+			});
+			return; // nothing relevant → nothing to validate or insert
+		}
+
+		// ---- validation gate ("no magic") ----
+		let chosen = hits;
+		let gateMode: string = cfg.confirm;
+		let cancelled = false;
+		if (cfg.confirm === "ask") {
+			const gate = await confirmGate(ctx as any, hits, cfg.pickTimeoutMs);
+			chosen = gate.chosen;
+			gateMode = gate.mode;
+			cancelled = gate.cancelled;
+		}
+
+		const block = chosen.length ? mem.formatContext(cfg, chosen) : "";
+		const accepted = new Set(chosen);
 		mem.appendAudit(cfg, sessionId, {
 			event: "recall", phase: "start", query: prompt,
-			k: cfg.k, above: aboveMin.length, // pre-slice signal (was hidden before)
-			hits: hits.map((r) => ({ id: r.id, score: +(r._score ?? 0).toFixed(2) })),
-			injected: !!block, chars: block.length,
+			k: cfg.k, above: aboveMin.length, mode: gateMode, cancelled,
+			hits: hits.map((r) => ({ id: r.id, score: +(r._score ?? 0).toFixed(2), accepted: accepted.has(r) })),
+			injected: !!block, chars: block.length, vehicle: "message",
 		});
-		if (!block) return; // nothing relevant → inject nothing
-		if (cfg.notify && hits.length) ctx.ui.notify(`specloop: recalled ${hits.length} related`, "info");
-		return { systemPrompt: `${event.systemPrompt}\n${block}` };
+		if (!block) {
+			if (cfg.notify) ctx.ui.notify(`specloop: no memories inserted${cancelled ? " (skipped)" : ""}`, "info");
+			return;
+		}
+		if (cfg.notify) ctx.ui.notify(`specloop: inserted ${chosen.length}/${hits.length} recalled`, "info");
+		return {
+			message: {
+				customType: "specloop-recall",
+				content: block,
+				display: true,
+				details: {
+					scores: chosen.map((r) => +(r._score ?? 0).toFixed(2)),
+					ids: chosen.map((r) => r.id),
+				},
+			},
+		};
 	});
 
 	// ---- END (write): one recap when the session quits -----------------------
@@ -145,7 +209,7 @@ export default function specloopPi(pi: ExtensionAPI) {
 
 	// ---- /specloop manual command ------------------------------------------
 	pi.registerCommand("specloop", {
-		description: "specloop memory: recall <query> | stats | off",
+		description: "specloop memory: recall <query> | pick [query] | stats | off",
 		handler: async (args, ctx) => {
 			const [sub, ...rest] = (args || "").trim().split(/\s+/);
 			try {
@@ -167,6 +231,40 @@ export default function specloopPi(pi: ExtensionAPI) {
 						lines.length ? `specloop recall:\n${lines.join("\n")}` : "specloop recall: (none)",
 						"info",
 					);
+				} else if (sub === "pick") {
+					// manual recall + validation gate + insert (no model turn triggered)
+					const q = rest.join(" ").trim() || firstPrompt;
+					if (!q) {
+						return ctx.ui.notify("usage: /specloop pick [query] (defaults to the session's first prompt)", "info");
+					}
+					if (!cfg.enabled || !memOk) return ctx.ui.notify("specloop is disabled", "warning");
+					const r: mem.RecallHit[] = mem.run(cfg, ["recall", q, "-k", String(cfg.k)], {
+						json: true,
+						timeoutMs: cfg.recallTimeoutMs,
+					});
+					const hits = (r || [])
+						.filter((h) => (h._score ?? 0) >= cfg.minScore && h.body)
+						.slice(0, 3);
+					if (!hits.length) return ctx.ui.notify("specloop pick: no related memories", "info");
+					const gate = await confirmGate(ctx as any, hits, cfg.pickTimeoutMs);
+					const block = gate.chosen.length ? mem.formatContext(cfg, gate.chosen) : "";
+					mem.appendAudit(cfg, sessionId, {
+						event: "recall", phase: "pick", query: q, mode: gate.mode, cancelled: gate.cancelled,
+						hits: hits.map((h) => ({
+							id: h.id, score: +(h._score ?? 0).toFixed(2), accepted: gate.chosen.includes(h),
+						})),
+						injected: !!block, chars: block.length, vehicle: "message",
+					});
+					if (!block) return ctx.ui.notify("specloop pick: nothing inserted", "info");
+					pi.sendMessage({
+						customType: "specloop-recall",
+						content: block,
+						display: true,
+						details: {
+							scores: gate.chosen.map((h) => +(h._score ?? 0).toFixed(2)),
+							ids: gate.chosen.map((h) => h.id),
+						},
+					}, { triggerTurn: false }); // idle → appended to the session, no turn
 				} else {
 					const shortMem = cfg.memPy.split("/").slice(-2).join("/");
 					ctx.ui.notify(

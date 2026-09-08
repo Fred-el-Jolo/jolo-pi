@@ -7,14 +7,26 @@
 | Hook | Fires | What happens |
 |---|---|---|
 | `session_start` | every session | cheap health probe (python3 + `mem.py` + db); resets per-session recall state. No memory op. |
-| `before_agent_start` | **first prompt only** (gated) | recall similar past recaps → inject into the **system prompt** for the run (transient, not stored). **Read-only — nothing is indexed here.** |
+| `before_agent_start` | **first prompt only** (gated) | recall similar past recaps → **show the candidates as a checkbox list — nothing is in LLM context yet** → insert ONLY the checked ones as a persistent session message (visible once in the transcript, in context for the whole session). **Read-only — nothing is indexed here.** |
 | `session_shutdown` | `reason === "quit"` only | build a digest from the session transcript (initial prompt, later prompts, tool errors) → one background model call → write **one recap node**. |
 
 That's the entire surface. No mid-session recall, no per-error capture, no per-turn writes.
 
+## The validation gate ("no magic")
+
+Memory systems that silently insert stuff you can't control are annoying. specloop's read side is **gated**: on the first prompt, the candidate recalls are shown as a **checkbox list** (`↑↓` move · `space` toggle · `a` all/none · `enter` insert checked · `esc` insert none) and **only the checked entries are inserted**. The list is rendered in the terminal only — nothing enters LLM context before you confirm, by construction (injection happens solely through the handler's return value, built from the checked subset).
+
+The insert is a **persistent session message** (`customType: "specloop-recall"`), not a system-prompt tweak:
+
+- displayed **once**, compactly, at its position in the transcript (expand to see the exact text the LLM gets) — it never re-renders on later messages;
+- sent to the model on **every turn** for the rest of the session (unlike the old systemPrompt override, which silently vanished after the first run); it sits early in the history so provider prompt-caching covers it, and compaction folds it away like any old message;
+- survives `/resume`.
+
+Fail-safes: `esc` inserts nothing (no re-asking this session); the recall spawn is hard-capped (`SPECLOOP_RECALL_TIMEOUT_MS`); the picker can auto-skip after a deadline for unattended runs (`SPECLOOP_PICK_TIMEOUT_MS`, default off); any picker/UI error fails **open** (auto-include, audited as `picker_error`); modes without a UI degrade sensibly — RPC gets a single confirm dialog, `print`/`json` auto-include.
+
 ## The two sides
 
-- **Read side (recall) — fully automatic, once.** On the session's first prompt, embed it, find the top-k similar past recaps, inject the hits above threshold into the system prompt. Pure cosine lookup; no model call on the read side (embeddings live in the engine).
+- **Read side (recall) — validated, once.** On the session's first prompt, embed it, find the top-k similar past recaps, show the hits above threshold as a checkable list, and insert the checked ones as a persistent session message (see [the validation gate](#the-validation-gate-no-magic)). Pure cosine lookup; no model call on the read side (embeddings live in the engine).
 - **Write side (recap) — one model call, at quit.** The recap is produced by a **dedicated cheap model** (default mistral) that sees the initial prompt + the session digest (how the subject evolved + the errors hit). It extracts **lessons** (`WHEN <situation> THEN <action>`); each is indexed with dedup-on-write. Confirmation is **evidence-based**: every lesson starts `tentative` and promotes to `confirmed` only via ≥2 *distinct sessions* re-learning it **or** ≥3 distinct calendar days (`meta.learned_days`) — the day-bar exists because heavily-resumed pi sessions re-learn under one session id. Neither the extractor's `done` verdict nor the merge arbiter's status suggestion can confirm anything. If the session did nothing meaningful, it writes nothing useful and dedup-on-write keeps the store clean.
 
 **The extension never does HTTP.** Embeddings AND chat both live in the python engine (`engine.py` + `semantic.py`), behind the `mem.py` CLI, sharing one model config (default: mistral). This module only shells out, formats the recall block, builds the digest, and injects/flushes.
@@ -44,6 +56,9 @@ Or drop a symlink in `~/.pi/agent/extensions/`, or install as a pi package (see 
 | `MISTRAL_API_KEY` | — | required for mistral embeddings + chat (same key) |
 | `SPECLOOP_K` | `5` | recall top-k |
 | `SPECLOOP_MIN_SCORE` | `0.4` | min cosine to inject a recall |
+| `SPECLOOP_CONFIRM` | `ask` | recall validation: `ask` = show the checkbox picker, insert only checked entries; `auto` = old behavior (insert all hits, no prompt) |
+| `SPECLOOP_RECALL_TIMEOUT_MS` | `6000` | hard cap on the recall spawn (it runs inside `before_agent_start`; a hang must never stall the run) |
+| `SPECLOOP_PICK_TIMEOUT_MS` | `0` (off) | auto-skip the validation picker after this long (countdown shown); 0 = wait for the user |
 | `SPECLOOP_MAX_CHARS_M0` | `2400` | recall injection budget (chars) |
 | `SPECLOOP_NOTIFY` | `0` | surface recalls/notices via `notify` |
 | `SPECLOOP_AUDIT` | `~/.specloop/audit.jsonl` | audit-log path (`0`/`off`/`false` disables) |
@@ -60,14 +75,15 @@ Or drop a symlink in `~/.pi/agent/extensions/`, or install as a pi package (see 
 
 - `/specloop` — status (on/off, k, thresholds, mem path).
 - `/specloop stats` — node counts by type.
-- `/specloop recall <query>` — manual similarity search.
+- `/specloop recall <query>` — manual similarity search (read-only preview).
+- `/specloop pick [query]` — manual recall **through the validation gate**: pick memories mid-session and insert them as a `specloop-recall` message without triggering a model turn (query defaults to the session's first prompt).
 - `/specloop off` — disable for this session.
 
 ## Auditing
 
 Memory **state** lives in the sqlite DB (`mem export`). Memory **use** — what was recalled/injected, what was written, enable/disable, recap lifecycle — is logged to `~/.specloop/audit.jsonl` by two writers:
 
-- the **extension** logs `recall` (query, `above` = hits ≥ minScore pre-slice, injected hits + scores, chars) and `lifecycle` (`enabled`, `disabled`, `recap_queued` + `total_prompts`/drift/errors, `recap_spawned` + spool name, `shutdown_skipped` + reason for reload/new/resume/fork, `recap_recovered`);
+- the **extension** logs `recall` (query, `above` = hits ≥ minScore pre-slice, `mode` = `picker|rpc_confirm|auto|auto_no_ui|picker_error`, `cancelled`, per-hit `accepted` flags, injected chars, `vehicle` = `message`) and `lifecycle` (`enabled`, `disabled`, `recap_queued` + `total_prompts`/drift/errors, `recap_spawned` + spool name, `shutdown_skipped` + reason for reload/new/resume/fork, `recap_recovered`);
 - **`mem.py`** logs `write` (every node indexed, incl. merged/dedup/void/error) and `merge` (arbiter decisions).
 
 Every line is stamped with `ts`, `session` (the pi session id), and `project`. Inspect:
@@ -108,7 +124,8 @@ specloop-pi/
 ├── README.md                 # this file
 ├── package.json              # pi-package manifest (extension only)
 └── extension/
-    ├── extension.ts          # entry: 3 hooks (session_start / before_agent_start / session_shutdown) + /specloop
+    ├── extension.ts          # entry: 3 hooks + renderer + /specloop (incl. pick)
+    ├── picker.ts             # validation gate: checkbox picker component + mode-aware confirmGate
     └── mem.ts                # config + mem.py bridge + recall formatting + digest builder (pure)
 ```
 
@@ -120,3 +137,4 @@ Engine + recap summarizer live in [`../../lib/specloop-core/scripts/`](../../lib
 - CLI end-to-end (`start` recall → `recap` write → dedup-on-write; `--spool-file` unlinked on both the error and success paths) offline with the `hash` embedder — green.
 - `tsc --strict` against pi's type definitions — clean.
 - Extension logic driven through a mock pi: first-prompt recall injects (audit carries `above` + `project`), second prompt is a no-op (once-per-session gate), `session_shutdown{reload}` logs `shutdown_skipped` (no recap), `session_shutdown{quit}` logs `recap_queued` (with `total_prompts`) + `recap_spawned` + writes the spool, the child unlinks the spool on completion and logs its write outcome, and a backdated spool file is picked up by `recoverSpooledRecaps` (`recap_recovered`) — all green.
+- Validation-gate suite (35 checks, mock pi + stub mem.py + the **real** picker component): checkbox subset selection → message contains only checked entries; esc → nothing inserted (`cancelled` audit); `auto` mode → no picker; picker crash → fail-open (`picker_error`); rpc confirm fallback both ways; print/json auto; `/specloop pick` inserts via `sendMessage` with no turn; render width discipline; recap spool unlink — all green.
