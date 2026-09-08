@@ -15,7 +15,7 @@
  * audited by the caller via `mode: "picker_error"`), because memory must not
  * break the run. Modes without a UI (print/-p, --mode json) auto-include.
  */
-import { Key, matchesKey, truncateToWidth } from "@earendil-works/pi-tui";
+import { Key, matchesKey, truncateToWidth, visibleWidth } from "@earendil-works/pi-tui";
 import { clip, type RecallHit } from "./mem.ts";
 
 /** Structural slice of pi's Theme — the real Theme satisfies this. */
@@ -26,11 +26,24 @@ export type ThemeLike = {
 
 export type PickOutcome = { kind: "confirm"; chosen: RecallHit[] } | { kind: "cancel" };
 
-/** Split a lesson body ("WHEN x THEN y") into two display lines. */
+/** Longest-fitting candidate: first entry (ordered longest → shortest) whose
+ * measured visible width fits `maxWidth`; falls back to the shortest, which
+ * the caller's truncateToWidth/clamp bounds to the real width. */
+function pickFitting(candidates: string[], maxWidth: number): string {
+	for (const c of candidates) {
+		if (visibleWidth(c) <= maxWidth) return c;
+	}
+	return candidates[candidates.length - 1] ?? "";
+}
+
+/** Split a lesson body ("WHEN x THEN y") into two display lines. Returns the
+ * normalized parts uncapped — display clipping is width-driven exclusively
+ * (truncateToWidth against the terminal width in render), never char-capped. */
 export function splitLesson(body: string): { when: string; then: string } {
+	const norm = (s: string) => (s || "").replace(/\s+/g, " ").trim();
 	const i = (body || "").search(/\bTHEN\b/i);
-	if (i < 0) return { when: clip(body, 90), then: "" };
-	return { when: clip(body.slice(0, i).trim(), 90), then: clip(body.slice(i).trim(), 110) };
+	if (i < 0) return { when: norm(body), then: "" };
+	return { when: norm(body.slice(0, i)), then: norm(body.slice(i)) };
 }
 
 export class RecallPickerComponent {
@@ -67,6 +80,9 @@ export class RecallPickerComponent {
 					this.onDirty();
 				}
 			}, 1000);
+			// a 1s UI countdown must never hold the host process (pi) open —
+			// same hygiene as the zai-footer poller. finish() still clears it.
+			this.ticker.unref?.();
 		}
 	}
 
@@ -114,10 +130,22 @@ export class RecallPickerComponent {
 		const t = this.theme;
 		const n = this.items.length;
 		const lines: string[] = [];
+		// EVERY line must pass through truncateToWidth: the TUI hard-crashes on
+		// any line wider than `width` (verified the hard way at terminal width 40).
 		lines.push(
-			t.fg("accent", t.bold(`specloop — ${n} related memor${n === 1 ? "y" : "ies"} found`)),
+			truncateToWidth(
+				t.fg("accent", t.bold(`specloop — ${n} related memor${n === 1 ? "y" : "ies"} found`)),
+				width,
+			),
 		);
-		lines.push(t.fg("dim", "check the memories to insert into this session's context"));
+		const sub = pickFitting(
+			[
+				"check the memories to insert into this session's context",
+				"check memories to insert",
+			],
+			width,
+		);
+		lines.push(truncateToWidth(t.fg("dim", sub), width));
 		lines.push("");
 		this.items.forEach((hit, i) => {
 			const cursor = i === this.cursor ? "❯ " : "  ";
@@ -129,13 +157,27 @@ export class RecallPickerComponent {
 			if (then) lines.push(truncateToWidth(`     ${t.fg("muted", then)}`, width));
 		});
 		lines.push("");
-		let help = "↑↓ move · space toggle · a all/none · enter insert checked · esc insert none";
-		if (this.deadline !== null) {
-			help += ` · auto-skip in ${Math.max(0, Math.ceil((this.deadline - Date.now()) / 1000))}s`;
-		}
-		lines.push(t.fg("dim", help));
-		this.cached = { width, lines };
-		return lines;
+		// help text: pick the longest variant whose MEASURED visible width fits
+		// (countdown suffix reserved first, if a deadline is active) — no magic
+		// breakpoints; the final clamp below guarantees the width contract
+		const countdown = this.deadline !== null
+			? ` · auto-skip in ${Math.max(0, Math.ceil((this.deadline - Date.now()) / 1000))}s`
+			: "";
+		const help =
+			pickFitting(
+				[
+					"↑↓ move · space toggle · a all/none · enter insert checked · esc insert none",
+					"↑↓ move · space toggle · a all/none · enter ok · esc none",
+					"space toggle · enter ok · esc none",
+					"space · enter · esc",
+				],
+				width - visibleWidth(countdown),
+			) + countdown;
+		lines.push(truncateToWidth(t.fg("dim", help), width));
+		// defense in depth: never emit a line wider than `width`, whatever happens above
+		const clamped = lines.map((l) => (visibleWidth(l) > width ? truncateToWidth(l, width) : l));
+		this.cached = { width, lines: clamped };
+		return clamped;
 	}
 
 	invalidate(): void {
@@ -205,7 +247,7 @@ export async function confirmGate(
 			const preview = hits
 				.map((h) => {
 					const { when } = splitLesson(h.body || "");
-					return `(${(h._score ?? 0).toFixed(2)}) ${when}`;
+					return `(${(h._score ?? 0).toFixed(2)}) ${clip(when, 90)}`; // no width context in a confirm dialog — bounded preview
 				})
 				.join("\n");
 			const ok = await ctx.ui.confirm(

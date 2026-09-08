@@ -41,6 +41,7 @@ const PICKER = new URL("../extension/picker.ts", import.meta.url).pathname;
 const theme = { fg: (_c: string, s: string) => s, bold: (s: string) => s };
 const tui = { requestRender: () => {} };
 const KEYS = { esc: "\x1b", enter: "\r", space: " ", up: "\x1b[A", down: "\x1b[B" };
+const { visibleWidth } = await import("@earendil-works/pi-tui");
 
 function mktmp(): string {
 	const d = path.join(os.tmpdir(), `specloop-mock-${Date.now()}`);
@@ -137,6 +138,8 @@ const pickerMod = await import(PICKER);
 	ok("splitLesson splits WHEN/THEN", s.when.startsWith("WHEN pi extension") && s.then.startsWith("THEN drive"));
 	const b = pickerMod.splitLesson("just a plain body");
 	ok("splitLesson plain body", b.when === "just a plain body" && b.then === "");
+	const long = pickerMod.splitLesson("WHEN " + "x".repeat(200) + " THEN do the thing");
+	ok("splitLesson is uncapped (width-driven clipping only)", long.when.length === 205 && long.then === "THEN do the thing");
 
 	const hits = [
 		{ id: "n1", type: "lesson", body: "WHEN a THEN b", meta: {}, _score: 0.9 },
@@ -146,7 +149,31 @@ const pickerMod = await import(PICKER);
 	const comp = new pickerMod.RecallPickerComponent(hits, theme, (o: any) => (outcome = o), () => {}, 0);
 	const lines = comp.render(80);
 	ok("render: 2 items, all pre-checked", lines.join("\n").includes("[x]") && lines.filter((l: string) => l.includes("[x]")).length === 2);
-	ok("render: every line within width", lines.every((l: string) => stripAnsiLen(l) <= 80));
+	ok("render: every line within width", lines.every((l: string) => visibleWidth(l) <= 80));
+	// width-contract battery — the TUI hard-crashes on ANY line wider than
+	// `width` (this exact bug crashed pi at terminal width 40: unclipped
+	// subtitle/help lines of visible width 56/76)
+	const realHits = [
+		{ id: "n1", type: "lesson", body: "WHEN pi extension tests hang THEN drive logic through a mock pi harness with a fairly long body", meta: {}, _score: 0.9 },
+		{ id: "n2", type: "lesson", body: "WHEN dedup threshold too high THEN measure on the live store before lowering it", meta: {}, _score: 0.72 },
+		{ id: "n3", type: "lesson", body: "plain body without a THEN clause, somewhat long", meta: {}, _score: 0.55 },
+	];
+	for (const w of [200, 80, 56, 40, 30, 20, 10, 1]) {
+		const c = new pickerMod.RecallPickerComponent(realHits, theme, () => {}, () => {}, 0);
+		const out = c.render(w);
+		ok(`width contract @${w}: every line ≤ ${w}`, out.every((l: string) => visibleWidth(l) <= w));
+	}
+	const c40 = new pickerMod.RecallPickerComponent(realHits, theme, () => {}, () => {}, 0);
+	const out40 = c40.render(40).map((l: string) => l.replace(/\x1b\[[0-9;]*m/g, ""));
+	ok("fitting help keeps esc visible @40", out40.some((l: string) => l.includes("esc")));
+	const c30 = new pickerMod.RecallPickerComponent(realHits, theme, () => {}, () => {}, 0);
+	const out30 = c30.render(30).map((l: string) => l.replace(/\x1b\[[0-9;]*m/g, ""));
+	ok("fitting help falls back to tiny variant, esc visible @30", out30.some((l: string) => l.includes("esc")));
+	const cWide = new pickerMod.RecallPickerComponent(realHits, theme, () => {}, () => {}, 0);
+	const outWide = cWide.render(200).map((l: string) => l.replace(/\x1b\[[0-9;]*m/g, ""));
+	ok("wide terminal shows full help variant", outWide.some((l: string) => l.includes("enter insert checked")));
+	const cDead = new pickerMod.RecallPickerComponent(realHits, theme, () => {}, () => {}, 60_000);
+	ok("deadline countdown fits width", cDead.render(30).every((l: string) => visibleWidth(l) <= 30));
 	comp.handleInput(KEYS.space);      // uncheck first
 	comp.handleInput(KEYS.down);
 	comp.handleInput(KEYS.enter);      // confirm
@@ -159,9 +186,6 @@ const pickerMod = await import(PICKER);
 	ok("component: 'a' toggles all off", comp3.render(80).join("\n").includes("[ ]"));
 }
 
-function stripAnsiLen(s: string): number {
-	return s.replace(/\x1b\[[0-9;]*m/g, "").length;
-}
 
 // --- scenario A: ask mode, user unchecks the middle hit, confirms ----------
 {
