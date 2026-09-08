@@ -14,7 +14,7 @@ That's the entire surface. No mid-session recall, no per-error capture, no per-t
 
 ## The validation gate ("no magic")
 
-Memory systems that silently insert stuff you can't control are annoying. specloop's read side is **gated**: on the first prompt, the candidate recalls are shown as a **checkbox list** (`↑↓` move · `space` toggle · `a` all/none · `enter` insert checked · `esc` insert none) and **only the checked entries are inserted**. The list is rendered in the terminal only — nothing enters LLM context before you confirm, by construction (injection happens solely through the handler's return value, built from the checked subset).
+Memory systems that silently insert stuff you can't control are annoying. specloop's read side is **gated**: on the first prompt, the candidate recalls are shown as a **checkbox list** (`↑↓` move · `space` toggle · `e` compact · `a` all/none · `enter` insert checked · `esc` insert none) and **only the checked entries are inserted**. Bodies render **fully, word-wrapped, at any terminal width** — on a phone-sized terminal you still see every word of what you're approving, never a 3-word ellipsis stub (via a proper reusable TUI component, `ExpandableText` — pi-tui's closest builtin, `TruncatedText`, is truncate-only: no expand, no wrap). `e` compacts the item under the cursor to a one-line preview, and back. The list is rendered in the terminal only — nothing enters LLM context before you confirm, by construction (injection happens solely through the handler's return value, built from the checked subset).
 
 The insert is a **persistent session message** (`customType: "specloop-recall"`), not a system-prompt tweak:
 
@@ -59,7 +59,7 @@ Or drop a symlink in `~/.pi/agent/extensions/`, or install as a pi package (see 
 | `SPECLOOP_CONFIRM` | `ask` | recall validation: `ask` = show the checkbox picker, insert only checked entries; `auto` = old behavior (insert all hits, no prompt) |
 | `SPECLOOP_RECALL_TIMEOUT_MS` | `6000` | hard cap on the recall spawn (it runs inside `before_agent_start`; a hang must never stall the run) |
 | `SPECLOOP_PICK_TIMEOUT_MS` | `0` (off) | auto-skip the validation picker after this long (countdown shown); 0 = wait for the user |
-| `SPECLOOP_MAX_CHARS_M0` | `2400` | recall injection budget (chars) |
+| `SPECLOOP_MAX_CHARS_M0` | `2400` | recall injection budget (chars) — the ONLY size cap: bodies are never per-line clipped; if the first body alone exceeds it, that body is clipped to the budget |
 | `SPECLOOP_NOTIFY` | `0` | surface recalls/notices via `notify` |
 | `SPECLOOP_AUDIT` | `~/.specloop/audit.jsonl` | audit-log path (`0`/`off`/`false` disables) |
 | `SPECLOOP_SESSION` | *(set by the extension)* | pi session id, stamped on every node + audit line (the memory↔session join key) |
@@ -126,6 +126,7 @@ specloop-pi/
 └── extension/
     ├── extension.ts          # entry: 3 hooks + renderer + /specloop (incl. pick)
     ├── picker.ts             # validation gate: checkbox picker component + mode-aware confirmGate
+    ├── expandable.ts         # ExpandableText — reusable TUI component (clipped one-liner ↔ full text word-wrapped)
     └── mem.ts                # config + mem.py bridge + recall formatting + digest builder (pure)
 ```
 
@@ -137,4 +138,4 @@ Engine + recap summarizer live in [`../../lib/specloop-core/scripts/`](../../lib
 - CLI end-to-end (`start` recall → `recap` write → dedup-on-write; `--spool-file` unlinked on both the error and success paths) offline with the `hash` embedder — green.
 - `tsc --strict` against pi's type definitions — clean.
 - Extension logic driven through a mock pi: first-prompt recall injects (audit carries `above` + `project`), second prompt is a no-op (once-per-session gate), `session_shutdown{reload}` logs `shutdown_skipped` (no recap), `session_shutdown{quit}` logs `recap_queued` (with `total_prompts`) + `recap_spawned` + writes the spool, the child unlinks the spool on completion and logs its write outcome, and a backdated spool file is picked up by `recoverSpooledRecaps` (`recap_recovered`) — all green.
-- Validation-gate suite (35 checks, mock pi + stub mem.py + the **real** picker component): checkbox subset selection → message contains only checked entries; esc → nothing inserted (`cancelled` audit); `auto` mode → no picker; picker crash → fail-open (`picker_error`); rpc confirm fallback both ways; print/json auto; `/specloop pick` inserts via `sendMessage` with no turn; render width discipline; recap spool unlink — all green.
+- Validation-gate suite (97 checks, mock pi + stub mem.py + the **real** picker component): checkbox subset selection → message contains only checked entries; esc → nothing inserted (`cancelled` audit); `auto` mode → no picker; picker crash → fail-open (`picker_error`); rpc confirm fallback both ways; print/json auto; `/specloop pick` inserts via `sendMessage` with no turn; render width discipline in **both** states (default fully-wrapped and `e`-compacted — every line obeys the width contract down to width 1); mobile default (width 34: every word of every body visible, no ellipsis); `ExpandableText` unit battery (collapsed ellipsis ↔ wrapped full text, every word survives wrapping, toggle/handleInput); uncapped `formatContext` (budget is the only cap; later hits dropped at the budget; a first body larger than the whole budget is clipped to it, not skipped); message-renderer width safety with long + unbreakable bodies (the width-40 crash class) in both collapsed and expanded states; recap spool unlink — all green.

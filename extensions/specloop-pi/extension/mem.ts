@@ -278,15 +278,28 @@ export function extractText(content: unknown): string {
 }
 
 /** Recall block for the system prompt (first prompt only). "" when no hits above
- * threshold → nothing is injected on quiet sessions. */
+ * threshold → nothing is injected on quiet sessions.
+ *
+ * No per-body cap: bodies are inserted whole (whitespace-normalized) and
+ * maxCharsM0 is the ONLY size limit — a per-line clip would hide text that no
+ * amount of expanding can recover. Display is width-safe regardless: the
+ * message renderer routes content through pi's Text component, which word-
+ * wraps (and hard-breaks unbreakable tokens) at render time. Degenerate case:
+ * if the FIRST body alone exceeds the whole budget, it is clipped to the
+ * budget rather than skipped ("something" beats "nothing"). */
 export function formatContext(cfg: Config, recalls: RecallHit[]): string {
 	const hits = recalls.filter((r) => (r._score ?? 0) >= cfg.minScore && r.body).slice(0, 3);
 	if (!hits.length) return "";
 	const lines = ["## related past work (auto-recalled — consider but verify)"];
-	let chars = 0;
+	let chars = lines[0].length + 1; // count the header — the budget caps the WHOLE block
 	for (const r of hits) {
-		const line = `- (${(r._score ?? 0).toFixed(2)}) ${clip(r.body, 220)}`;
-		if (chars + line.length > cfg.maxCharsM0) break;
+		const body = (r.body || "").replace(/\s+/g, " ").trim();
+		let line = `- (${(r._score ?? 0).toFixed(2)}) ${body}`;
+		const remaining = cfg.maxCharsM0 - chars;
+		if (line.length > remaining) {
+			if (lines.length === 1) line = line.slice(0, Math.max(0, remaining - 1)) + "…";
+			else break; // budget exhausted → stop, keep what fits
+		}
 		lines.push(line);
 		chars += line.length;
 	}

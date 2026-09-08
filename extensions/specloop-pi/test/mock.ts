@@ -131,6 +131,14 @@ const ok = (name: string, cond: boolean, extra?: string) => {
 // ---------------------------------------------------------------- scenarios
 const { default: specloopPi } = await import(EXT);
 const pickerMod = await import(PICKER);
+const expandableMod = await import(new URL("../extension/expandable.ts", import.meta.url).pathname);
+
+// ---- shared fixtures (used by the unit blocks below) ----------------------
+const realHits = [
+	{ id: "n1", type: "lesson", body: "WHEN pi extension tests hang THEN drive logic through a mock pi harness with a fairly long body", meta: {}, _score: 0.9 },
+	{ id: "n2", type: "lesson", body: "WHEN dedup threshold too high THEN measure on the live store before lowering it", meta: {}, _score: 0.72 },
+	{ id: "n3", type: "lesson", body: "plain body without a THEN clause, somewhat long", meta: {}, _score: 0.55 },
+];
 
 // --- unit: splitLesson + component render/keys -----------------------------
 {
@@ -153,11 +161,6 @@ const pickerMod = await import(PICKER);
 	// width-contract battery — the TUI hard-crashes on ANY line wider than
 	// `width` (this exact bug crashed pi at terminal width 40: unclipped
 	// subtitle/help lines of visible width 56/76)
-	const realHits = [
-		{ id: "n1", type: "lesson", body: "WHEN pi extension tests hang THEN drive logic through a mock pi harness with a fairly long body", meta: {}, _score: 0.9 },
-		{ id: "n2", type: "lesson", body: "WHEN dedup threshold too high THEN measure on the live store before lowering it", meta: {}, _score: 0.72 },
-		{ id: "n3", type: "lesson", body: "plain body without a THEN clause, somewhat long", meta: {}, _score: 0.55 },
-	];
 	for (const w of [200, 80, 56, 40, 30, 20, 10, 1]) {
 		const c = new pickerMod.RecallPickerComponent(realHits, theme, () => {}, () => {}, 0);
 		const out = c.render(w);
@@ -184,6 +187,127 @@ const pickerMod = await import(PICKER);
 	const comp3 = new pickerMod.RecallPickerComponent(hits, theme, (o: any) => (outcome = o), () => {}, 0);
 	comp3.handleInput("a");           // all→none
 	ok("component: 'a' toggles all off", comp3.render(80).join("\n").includes("[ ]"));
+}
+
+// --- unit: ExpandableText component (ellipsis → full text, word-wrapped) ---
+const stripAnsi = (l: string) => l.replace(/\x1b\[[0-9;]*m/g, "");
+const thenLong = "THEN drive logic through a mock pi harness instead of spawning a real TUI, which is slow and flaky";
+const fullBody = "WHEN pi extension tests hang " + thenLong;
+const makeET = (open = false) =>
+	new expandableMod.ExpandableText({
+		theme,
+		indent: 5,
+		collapsed: [{ text: thenLong, color: "muted" }],
+		expanded: [{ text: fullBody, color: "muted" }],
+		expandedByDefault: open,
+	});
+{
+	const col = makeET().render(40);
+	ok("ET: collapsed = single line ≤ width, ellipsis when clipped",
+		col.length === 1 && visibleWidth(col[0]) <= 40 && col[0].includes("…"));
+	const exp = makeET(true).render(40);
+	ok("ET: expanded = multi-line, all ≤ width, no ellipsis",
+		exp.length > 1 && exp.every((l: string) => visibleWidth(l) <= 40) && !exp.some((l: string) => l.includes("…")));
+	ok("ET: expanded keeps every word of the full text",
+		fullBody.split(" ").every((w) => exp.map(stripAnsi).join(" ").includes(w)));
+	const et = makeET();
+	ok("ET: starts collapsed; 'e' via handleInput opens", et.handleInput("e") === true && et.isExpanded());
+	ok("ET: other keys not consumed", et.handleInput("x") === false);
+	et.toggle();
+	ok("ET: toggle back → single line", et.render(40).length === 1);
+	for (const w of [200, 80, 40, 20, 10, 1]) {
+		const a = makeET().render(w);
+		const b = makeET(true).render(w);
+		ok(`ET width contract @${w}: every line ≤ ${w} in both states`,
+			a.every((l: string) => visibleWidth(l) <= w) && b.every((l: string) => visibleWidth(l) <= w));
+	}
+	ok("ET: empty segments render nothing",
+		new expandableMod.ExpandableText({ theme, collapsed: [], expanded: [] }).render(40).length === 0);
+}
+
+// --- unit: picker — full bodies wrapped BY DEFAULT; "e" compacts ----------
+{
+	const cHelp = new pickerMod.RecallPickerComponent(realHits, theme, () => {}, () => {}, 0);
+	ok("picker: help mentions e expand", cHelp.render(120).map(stripAnsi).join(" ").includes("e expand"));
+	// width contract in BOTH states at every size — default (wrapped) and
+	// compact ("e") — the wrapped blocks must obey it down to width 1
+	for (const w of [200, 80, 56, 40, 30, 20, 10, 1]) {
+		const cDef = new pickerMod.RecallPickerComponent(realHits, theme, () => {}, () => {}, 0);
+		ok(`width contract (default wrapped) @${w}: every line ≤ ${w}`, cDef.render(w).every((l: string) => visibleWidth(l) <= w));
+		const cFold = new pickerMod.RecallPickerComponent(realHits, theme, () => {}, () => {}, 0);
+		cFold.handleInput("e");
+		ok(`width contract (compact) @${w}: every line ≤ ${w}`, cFold.render(w).every((l: string) => visibleWidth(l) <= w));
+	}
+	// THE mobile fix: a fresh picker at a phone-ish width shows EVERY word of
+	// EVERY body by default — no ellipsis anywhere until the user compacts
+	const cMob = new pickerMod.RecallPickerComponent(realHits, theme, () => {}, () => {}, 0);
+	const mobJoined = cMob.render(34).map(stripAnsi).join(" ");
+	for (const h of realHits) {
+		ok(`picker @34: full body of ${h.id} visible by default`, h.body.split(" ").every((w) => mobJoined.includes(w)));
+	}
+	ok("picker @34: no ellipsis by default", !mobJoined.includes("…"));
+	// "e" compacts the cursor item back to the one-line preview
+	const cExp = new pickerMod.RecallPickerComponent(realHits, theme, () => {}, () => {}, 0);
+	const fullLen = cExp.render(40).length;
+	cExp.handleInput("e"); // compact item 0
+	const compactJoined = cExp.render(40).map(stripAnsi).join(" ");
+	ok("picker: e compacts cursor item (tail hidden again)",
+		cExp.render(40).length < fullLen && !compactJoined.includes("fairly long body"));
+	ok("picker: other items stay fully visible", compactJoined.includes("lowering"));
+	cExp.handleInput("e");
+	ok("picker: e again re-expands", cExp.render(40).length === fullLen);
+	// compact state survives navigation; enter confirms from either state
+	let navOutcome: any = null;
+	const cNav = new pickerMod.RecallPickerComponent(realHits, theme, (o: any) => (navOutcome = o), () => {}, 0);
+	cNav.handleInput(KEYS.down);
+	cNav.handleInput("e"); // compact item 1 only
+	const navJoined = cNav.render(40).map(stripAnsi).join(" ");
+	ok("picker: compact item stays compact after cursor moves away (item 0 still full)",
+		!navJoined.includes("lowering") && realHits[0].body.split(" ").every((w) => navJoined.includes(w)));
+	cNav.handleInput(KEYS.space); // uncheck item 1
+	cNav.handleInput(KEYS.enter); // confirm
+	ok("picker: enter confirms from mixed compact/expanded view",
+		navOutcome?.kind === "confirm" && navOutcome.chosen.length === 2 && navOutcome.chosen[0].id === "n1");
+}
+
+// --- unit: formatContext — budget is the only cap, no per-body clip -------
+const memMod = await import(new URL("../extension/mem.ts", import.meta.url).pathname);
+{
+	const longBody = "WHEN testing formatContext budgets THEN " + "word ".repeat(120).trim(); // ~700 chars
+	const mk = (body: string, score = 0.9) => ({ id: "x", type: "lesson", body, meta: {}, _score: score });
+	const out = memMod.formatContext({ minScore: 0.4, maxCharsM0: 2400 } as any, [mk(longBody)]);
+	ok("fmt: long body kept whole (no per-body cap)", out.includes(longBody) && !out.includes("…"));
+	const two = memMod.formatContext({ minScore: 0.4, maxCharsM0: 300 } as any, [mk(longBody), mk("WHEN a THEN b", 0.8)]);
+	ok("fmt: budget stops later hits (first alone > budget → clipped, second dropped)",
+		!two.includes("WHEN a THEN b") && two.includes("…") && two.length <= 300);
+	const degenerate = memMod.formatContext({ minScore: 0.4, maxCharsM0: 300 } as any, [mk(longBody)]);
+	const degenHit = degenerate.split("\n")[1] ?? "";
+	ok("fmt: first body > whole budget → clipped to budget, still inserts",
+		degenerate.length <= 300 && degenHit.startsWith("- (0.90)") && degenHit.endsWith("…"));
+}
+
+// --- unit: renderer width-safety with uncapped bodies (the width-40 crash class)
+{
+	const h = freshPi();
+	specloopPi(h.pi as any);
+	const r = h.renderers["specloop-recall"];
+	// one long normal body + one unbreakable monster token — expanded view must
+	// still obey the width contract at every terminal size (Text wraps/hard-breaks)
+	const unbreakable = "WHEN " + "x".repeat(300) + " THEN do the thing";
+	const spaced = "WHEN " + "many words ".repeat(60).trim() + " THEN wrap";
+	const msg = {
+		content: `## related past work\n- (0.90) ${unbreakable}\n- (0.72) ${spaced}`,
+		details: { scores: [0.9, 0.72] },
+	};
+	for (const w of [200, 80, 40, 20, 10, 1]) {
+		const collapsed = r(msg, { expanded: false }, theme).render(w);
+		const expandedComp = r(msg, { expanded: true }, theme).render(w);
+		ok(`renderer width contract (uncapped bodies) @${w}: every line ≤ ${w}, both states`,
+			collapsed.every((l: string) => visibleWidth(l) <= w) && expandedComp.every((l: string) => visibleWidth(l) <= w));
+	}
+	const expandedText = r(msg, { expanded: true, outputPad: 0 }, theme).render(40).map(stripAnsi).join(" ");
+	ok("renderer: expanded shows the full uncapped bodies",
+		expandedText.includes("do the thing") && expandedText.includes("THEN wrap") && expandedText.replace(/[^x]/g, "").length >= 300);
 }
 
 

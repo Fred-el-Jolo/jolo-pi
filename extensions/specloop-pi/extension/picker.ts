@@ -16,13 +16,10 @@
  * break the run. Modes without a UI (print/-p, --mode json) auto-include.
  */
 import { Key, matchesKey, truncateToWidth, visibleWidth } from "@earendil-works/pi-tui";
+import { ExpandableText, type ThemeLike } from "./expandable.ts";
 import { clip, type RecallHit } from "./mem.ts";
 
-/** Structural slice of pi's Theme — the real Theme satisfies this. */
-export type ThemeLike = {
-	fg: (color: string, text: string) => string;
-	bold: (text: string) => string;
-};
+export type { ThemeLike };
 
 export type PickOutcome = { kind: "confirm"; chosen: RecallHit[] } | { kind: "cancel" };
 
@@ -52,6 +49,7 @@ export class RecallPickerComponent {
 	private onDone: (outcome: PickOutcome) => void;
 	private onDirty: () => void;
 	private checked: boolean[];
+	private bodies: ExpandableText[]; // per-item detail block (THEN line ↔ full body)
 	private cursor = 0;
 	private cached: { width: number; lines: string[] } | null = null;
 	private finished = false;
@@ -70,6 +68,20 @@ export class RecallPickerComponent {
 		this.onDone = onDone;
 		this.onDirty = onDirty;
 		this.checked = items.map(() => true); // default: everything pre-checked
+		// detail block per item — DEFAULT is the full body, word-wrapped, so a
+		// narrow terminal (mobile) shows every word while the user decides;
+		// "e" compacts the item to the old one-line WHEN + THEN preview
+		this.bodies = items.map((hit) => {
+			const { when, then } = splitLesson(hit.body || "");
+			const full = then ? `${when} ${then}` : when;
+			return new ExpandableText({
+				theme,
+				indent: 5,
+				collapsed: then ? [{ text: then, color: "muted" }] : [],
+				expanded: [{ text: full, color: "muted" }],
+				expandedByDefault: true,
+			});
+		});
 		this.deadline = timeoutMs > 0 ? Date.now() + timeoutMs : null;
 		if (this.deadline !== null) {
 			this.ticker = setInterval(() => {
@@ -112,12 +124,21 @@ export class RecallPickerComponent {
 		this.cached = null;
 	}
 
+	/** "e": compact/expand the item under the cursor (one-line preview ↔ full body). */
+	private toggleExpand(i = this.cursor): void {
+		const b = this.bodies[i];
+		if (!b) return;
+		b.toggle();
+		this.cached = null;
+	}
+
 	handleInput(data: string): void {
 		if (this.finished) return;
 		if (matchesKey(data, Key.up) || data === "k") this.move(-1);
 		else if (matchesKey(data, Key.down) || data === "j") this.move(1);
 		else if (matchesKey(data, Key.space)) this.toggle();
 		else if (data === "a") this.toggleAll();
+		else if (data === "e") this.toggleExpand();
 		else if (matchesKey(data, Key.enter)) {
 			this.finish({ kind: "confirm", chosen: this.items.filter((_, i) => this.checked[i]) });
 		} else if (matchesKey(data, Key.escape)) {
@@ -151,10 +172,16 @@ export class RecallPickerComponent {
 			const cursor = i === this.cursor ? "❯ " : "  ";
 			const box = this.checked[i] ? t.fg("success", "[x]") : t.fg("dim", "[ ]");
 			const score = t.fg("dim", (hit._score ?? 0).toFixed(2));
-			const { when, then } = splitLesson(hit.body || "");
-			const head = t.fg(i === this.cursor ? "accent" : "text", when);
-			lines.push(truncateToWidth(`${cursor}${box} ${score} ${head}`, width));
-			if (then) lines.push(truncateToWidth(`     ${t.fg("muted", then)}`, width));
+			const { when } = splitLesson(hit.body || "");
+			// expanded (default): the full body wraps below, so the header drops
+			// the WHEN part — no point repeating the same clipped words twice
+			const head = this.bodies[i].isExpanded()
+				? ""
+				: ` ${t.fg(i === this.cursor ? "accent" : "text", when)}`;
+			lines.push(truncateToWidth(`${cursor}${box} ${score}${head}`, width));
+			// detail block: expanded (default) = FULL body word-wrapped — nothing
+			// is ever hidden at any width; "e" compacts to the one-line preview
+			lines.push(...this.bodies[i].render(width));
 		});
 		lines.push("");
 		// help text: pick the longest variant whose MEASURED visible width fits
@@ -166,8 +193,8 @@ export class RecallPickerComponent {
 		const help =
 			pickFitting(
 				[
-					"↑↓ move · space toggle · a all/none · enter insert checked · esc insert none",
-					"↑↓ move · space toggle · a all/none · enter ok · esc none",
+					"↑↓ move · space toggle · e expand · a all/none · enter insert checked · esc insert none",
+					"↑↓ move · space toggle · e expand · enter ok · esc none",
 					"space toggle · enter ok · esc none",
 					"space · enter · esc",
 				],
@@ -182,6 +209,7 @@ export class RecallPickerComponent {
 
 	invalidate(): void {
 		this.cached = null;
+		for (const b of this.bodies) b.invalidate();
 	}
 }
 
