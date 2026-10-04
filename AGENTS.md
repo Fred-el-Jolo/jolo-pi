@@ -31,9 +31,10 @@ pi is a coding agent harness with a TUI. It is extended through a few distinct s
 
 ## Canonical references
 
-Pi's installed docs (read these before implementing anything pi-specific):
+Pi's installed docs (read these before implementing anything pi-specific). Pi is installed through mise (`npm:@earendil-works/pi-coding-agent`, see `~/.config/mise/config.toml`), so the install root is version-specific — resolve it with `mise where npm:@earendil-works/pi-coding-agent` (not `npm root -g`):
 
-- Main: `README.md` under `$(npm root -g)/@earendil-works/pi-coding-agent/`
+- Install root: `$(mise where npm:@earendil-works/pi-coding-agent)/node_modules/@earendil-works/pi-coding-agent/`
+- Main: `README.md` under the install root
 - Docs dir: `…/pi-coding-agent/docs/` — notably `extensions.md`, `tui.md`, `themes.md`, `custom-provider.md`, `rpc.md`, `environment-variables.md`, `settings.md`
 - Examples dir: `…/pi-coding-agent/examples/` — `extensions/`, `sdk/`, `rpc-extension-ui.ts`
 

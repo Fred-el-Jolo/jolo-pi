@@ -3,7 +3,7 @@
 How `extensions/zai-footer.ts` works (tier B: live account quota). For later review.
 
 Doc paths are relative to the pi install root:
-`$(npm root -g)/@earendil-works/pi-coding-agent/`.
+`$(mise where npm:@earendil-works/pi-coding-agent)/node_modules/@earendil-works/pi-coding-agent/`.
 
 ---
 
