@@ -9,6 +9,8 @@
  * Source: GET https://api.z.ai/api/monitor/usage/quota/limit  (Bearer <zai key>)
  *   → { data: { level, limits: [ {usage:cap, currentValue:used, remaining,
  *       percentage:%used, nextResetTime:epochMs}, … (5h, weekly) ] } }
+ *   Absent/null numerics (no usage window started yet) degrade per-field —
+ *   a missing reset time never hides a renderable percentage, never NaN.
  *
  * Why this replaced the session-credit estimate (tier A): the API gives the
  * actual account-wide remaining/used/reset, which is what "how much do I have
@@ -127,39 +129,61 @@ async function fetchQuota(key: string): Promise<QuotaData | null> {
 	}
 }
 
-/**
- * Build the footer segment. Limits are sorted by nextResetTime: nearest reset
+/** Finite epoch-ms in the future, else null (window not started → absent). */
+function resetAt(t: unknown): number | null {
+	return typeof t === "number" && Number.isFinite(t) && t > 0 ? t : null;
+}
+/** Finite %used, else null. */
+function pctUsed(p: unknown): number | null {
+	return typeof p === "number" && Number.isFinite(p) ? p : null;
+}
+
+/** Build the footer segment. Limits are sorted by nextResetTime: nearest reset
  * = the 5h window, farthest = weekly (robust regardless of unit/number codes).
- */
+ * When any reset time is absent (no usage window started yet) the sort is
+ * meaningless — fall back to the API's own array order, and degrade each
+ * numeric field per-field instead of rendering NaN. */
 /** Width-1 (non-emoji) symbols for the peak / off-peak window. */
 const PEAK_ON = "●"; // filled = peak (on)
 const PEAK_OFF = "○"; // hollow = off-peak (off)
 
-function buildStatus(
+export function buildStatus(
 	theme: { fg: (token: string, text: string) => string },
 	data: QuotaData,
 	now = Date.now(),
 ): string {
-	const limits = [...data.limits].sort((a, b) => a.nextResetTime - b.nextResetTime);
+	const rank = (t: unknown) => (resetAt(t) !== null ? (t as number) : Number.MAX_SAFE_INTEGER);
+	const allReal = data.limits.every((l) => rank(l.nextResetTime) !== Number.MAX_SAFE_INTEGER);
+	const limits = allReal
+		? [...data.limits].sort((a, b) => (a.nextResetTime as number) - (b.nextResetTime as number))
+		: [...data.limits]; // absent reset times: keep z.ai's order (5h first)
 	const fiveH = limits[0];
 	const weekly = limits[1];
 	const peakNow = !isOffPeakSGT();
 	const parts: string[] = [];
 
 	if (fiveH) {
-		const color =
-			fiveH.percentage >= ERROR_AT_PCT
-				? "error"
-				: fiveH.percentage >= WARN_AT_PCT
-					? "warning"
-					: "accent";
-		parts.push(theme.fg(color, `⚡5h ${fiveH.percentage}%`));
-		parts.push(theme.fg("dim", ` · ↻${fmtDur(fiveH.nextResetTime, now)}`));
+		const pct = pctUsed(fiveH.percentage);
+		if (pct !== null) {
+			const color =
+				pct >= ERROR_AT_PCT
+					? "error"
+					: pct >= WARN_AT_PCT
+						? "warning"
+						: "accent";
+			parts.push(theme.fg(color, `⚡5h ${pct}%`));
+		}
+		const reset = resetAt(fiveH.nextResetTime);
+		if (reset !== null) parts.push(theme.fg("dim", ` · ↻${fmtDur(reset, now)}`));
 	}
 	if (weekly) {
-		parts.push(
-			theme.fg("dim", ` │ wk ${weekly.percentage}% · ↻${fmtDurWk(weekly.nextResetTime, now)}`),
-		);
+		const pct = pctUsed(weekly.percentage);
+		const reset = resetAt(weekly.nextResetTime);
+		if (pct !== null || reset !== null) {
+			parts.push(theme.fg("dim", " │ wk"));
+			if (pct !== null) parts.push(theme.fg("dim", ` ${pct}%`));
+			if (reset !== null) parts.push(theme.fg("dim", ` · ↻${fmtDurWk(reset, now)}`));
+		}
 	}
 	parts.push(theme.fg("dim", " │ "));
 	parts.push(theme.fg(peakNow ? "warning" : "success", peakNow ? PEAK_ON : PEAK_OFF));
